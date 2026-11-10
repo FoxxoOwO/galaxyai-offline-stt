@@ -554,16 +554,73 @@ object SttEngineManager {
      * jsou proto výrazně efektivnější i kvalitnější — 30 s je přirozená délka
      * kontextu Whisperu.
      */
+    /**
+     * Pro monology (hlasové schránky, diktáty) rozdělí audio na plynulá dlouhá okna (až 28 sekund)
+     * s jednotným mluvčím (speakerId = 0 -> Mluvčí 1).
+     * Zabraňuje fragmentaci na sub-sekundové úseky a halucinacím Whisperu.
+     */
+    private fun buildMonologueWindows(
+        totalDurationMs: Int,
+        floatSamples: FloatArray,
+        sampleRate: Int = 16000,
+        maxWindowMs: Int = 28000
+    ): List<SegmentInfo> {
+        if (totalDurationMs <= maxWindowMs) {
+            return listOf(SegmentInfo(0, totalDurationMs, 0))
+        }
+
+        val windows = mutableListOf<SegmentInfo>()
+        var startMs = 0
+
+        while (startMs < totalDurationMs) {
+            val nominalEnd = Math.min(startMs + maxWindowMs, totalDurationMs)
+            if (nominalEnd >= totalDurationMs) {
+                windows.add(SegmentInfo(startMs, totalDurationMs, 0))
+                break
+            }
+
+            // Hledáme bod s nejnižší energií (pauzu/ticho) v intervalu [nominalEnd - 3000 ms .. nominalEnd]
+            val searchStartMs = Math.max(startMs + 10000, nominalEnd - 3000)
+            var bestCutMs = nominalEnd
+            var minRms = Float.MAX_VALUE
+
+            val stepMs = 100
+            var t = searchStartMs
+            while (t < nominalEnd) {
+                val sampleIdx = ((t.toLong() * sampleRate) / 1000L).toInt().coerceIn(0, floatSamples.size - 1)
+                val windowSize = (stepMs * sampleRate / 1000).coerceAtMost(floatSamples.size - sampleIdx)
+                var sumSq = 0f
+                for (s in 0 until windowSize) {
+                    val v = floatSamples[sampleIdx + s]
+                    sumSq += v * v
+                }
+                val rms = Math.sqrt((sumSq / windowSize.coerceAtLeast(1)).toDouble()).toFloat()
+                if (rms < minRms) {
+                    minRms = rms
+                    bestCutMs = t
+                }
+                t += stepMs
+            }
+
+            windows.add(SegmentInfo(startMs, bestCutMs, 0))
+            startMs = bestCutMs
+        }
+
+        return windows.filter { it.endMs > it.startMs }
+    }
+
     private fun buildDecodeWindows(
         diarized: List<SegmentInfo>,
         floatSamples: FloatArray,
         sampleRate: Int = 16000,
-        joinGapMs: Int = 900,
-        maxWindowMs: Int = 30000
+        joinGapMs: Int = 1800,
+        maxWindowMs: Int = 30000,
+        minWindowMs: Int = 2500
     ): List<SegmentInfo> {
         if (diarized.isEmpty()) return emptyList()
 
         val totalSamples = floatSamples.size
+        val totalMs = (totalSamples * 1000L / sampleRate).toInt()
         val windows = mutableListOf<SegmentInfo>()
         var winStart = diarized[0].startMs
         var winEnd = diarized[0].endMs
@@ -585,9 +642,26 @@ object SttEngineManager {
         }
         windows.add(SegmentInfo(winStart, winEnd, winSpeaker))
 
+        // Ošetření minimální délky okna:
+        // Whisper potřebuje alespoň 2.5 s kontextu, aby nehalucinoval na sub-sekundových úsecích.
+        val expanded = mutableListOf<SegmentInfo>()
+        for (w in windows) {
+            val dur = w.endMs - w.startMs
+            if (dur >= minWindowMs) {
+                expanded.add(w)
+            } else {
+                val needed = minWindowMs - dur
+                val padBefore = needed / 2
+                val padAfter = needed - padBefore
+                val newStart = (w.startMs - padBefore).coerceAtLeast(0)
+                val newEnd = (w.endMs + padAfter).coerceAtMost(totalMs)
+                expanded.add(SegmentInfo(newStart, newEnd, w.speakerId))
+            }
+        }
+
         // Rozdělení příliš dlouhých oken na části, aby dekódování zůstalo rychlé a stabilní
         val result = mutableListOf<SegmentInfo>()
-        for (w in windows) {
+        for (w in expanded) {
             val length = w.endMs - w.startMs
             if (length <= maxWindowMs) {
                 result.add(w)
@@ -602,7 +676,6 @@ object SttEngineManager {
         }
 
         // Oříznutí na rozsah audia
-        val totalMs = (totalSamples * 1000L / sampleRate).toInt()
         return result.filter { it.endMs > it.startMs }
             .map { SegmentInfo(it.startMs.coerceIn(0, totalMs), it.endMs.coerceIn(0, totalMs), it.speakerId) }
             .filter { it.endMs > it.startMs }
@@ -1059,7 +1132,9 @@ object SttEngineManager {
     fun transcribe(
         pcmBytes: ByteArray,
         localeTag: String = "cs-CZ",
-        externalSegments: List<SegmentInfo>? = null
+        externalSegments: List<SegmentInfo>? = null,
+        isVoicemail: Boolean = false,
+        isCall: Boolean = false
     ): SttResult {
         val langInfo = ModuleConfig.getLanguageByLocale(localeTag)
         val whisperLang = langInfo?.whisperCode ?: localeTag.substringBefore("-").substringBefore("_").lowercase().takeIf { it.isNotBlank() } ?: "cs"
@@ -1078,7 +1153,7 @@ object SttEngineManager {
         }
 
         val totalDurationMs = (sampleCount * 1000L / 16000L).toInt()
-        Log.i(TAG, "[SttEngine] Celková délka audia: ${totalDurationMs} ms (${sampleCount} vzorků), maxPeak: $maxAbs")
+        Log.i(TAG, "[SttEngine] Celková délka audia: ${totalDurationMs} ms (${sampleCount} vzorků), maxPeak: $maxAbs, isVoicemail=$isVoicemail, isCall=$isCall")
 
         // Auto-gain pro tiché nahrávky
         if (maxAbs in 0.005f..0.35f) {
@@ -1095,9 +1170,16 @@ object SttEngineManager {
             return buildFallbackResult(totalDurationMs, langInfo?.displayName ?: "zvoleného jazyka", isModelMissing = true)
         }
 
+        // Hlasová schránka je z definice monolog jednoho volajícího (Mluvčí 1).
+        // Krátké nahrávky do 25 sekund, které nejsou telefonním hovorem, jsou rovněž typicky monolog (hlasová poznámka/diktát).
+        val isSingleSpeaker = isVoicemail || (!isCall && totalDurationMs <= 25000L)
+
         // Získání segmentů řeči:
-        // Buď z externího diarizéru (Samsung native), nebo z naší interní VAD + akustické diarizace
-        val targetSegments: List<SegmentInfo> = if (!externalSegments.isNullOrEmpty()) {
+        // Buď jednomluvčí okno (hlasová schránka/poznámka), externí diarizér, nebo interní VAD + akustická diarizace
+        val targetSegments: List<SegmentInfo> = if (isSingleSpeaker) {
+            Log.i(TAG, "[SttEngine] Jednomluvčí režim (isVoicemail=$isVoicemail, isCall=$isCall, délka=${totalDurationMs} ms) -> celistvé okno s 1 mluvčím.")
+            buildMonologueWindows(totalDurationMs, floatSamples, 16000, maxWindowMs = 28000)
+        } else if (!externalSegments.isNullOrEmpty()) {
             val normalized = normalizeExternalSegments(externalSegments, totalDurationMs)
             if (normalized.isEmpty()) {
                 Log.w(TAG, "[SttEngine] Externí diarizér nevrátil použitelné segmenty, počítám vlastní VAD.")
@@ -1175,7 +1257,7 @@ object SttEngineManager {
                 val text = res.text.trim()
                 if (text.isNotEmpty()) {
                     recognizedSentences.add(text)
-                    resultSegments.add(SegmentInfo(0, totalDurationMs, 1))
+                    resultSegments.add(SegmentInfo(0, totalDurationMs, 0))
                     val words = text.split(Regex("\\s+")).filter { it.isNotBlank() }
                     val wordDur = if (words.isNotEmpty()) totalDurationMs / words.size else 100
                     for (i in words.indices) {

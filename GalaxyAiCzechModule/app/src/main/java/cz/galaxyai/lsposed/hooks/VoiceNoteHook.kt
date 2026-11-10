@@ -20,6 +20,29 @@ object VoiceNoteHook {
         hookLanguageSelection(lpparam.classLoader)
         hookTranslation(lpparam.classLoader)
         hookAsrResultData(lpparam.classLoader)
+        hookFastConvert(lpparam.classLoader)
+    }
+
+    /**
+     * Zaznamená cestu k převáděnému souboru (např. hlasová schránka, nahrávka hovoru).
+     * Díky tomu víme, jaký typ audio obsahu přepisujeme (voicemail = 1 mluvčí, celistvé okno).
+     */
+    private fun hookFastConvert(classLoader: ClassLoader) {
+        try {
+            val fastConvertClass = XposedHelpers.findClass("com.sec.android.app.voicenote.engine.FastConvertController", classLoader)
+            val handler = object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val filePath = param.args.getOrNull(1) as? String ?: return
+                    Log.i(TAG, "[VoiceNote] FastConvert zaznamenán pro: $filePath")
+                    ModuleConfig.recordActiveSession(filePath)
+                }
+            }
+            de.robv.android.xposed.XposedBridge.hookAllMethods(fastConvertClass, "startFastConvert", handler)
+            de.robv.android.xposed.XposedBridge.hookAllMethods(fastConvertClass, "addFastConvertItem", handler)
+            Log.i(TAG, "[VoiceNote] Úspěšně zahookován FastConvertController (startFastConvert, addFastConvertItem)")
+        } catch (t: Throwable) {
+            Log.w(TAG, "[VoiceNote] Hook na FastConvertController selhal: ${t.message}")
+        }
     }
 
     /**

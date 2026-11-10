@@ -461,4 +461,82 @@ object ModuleConfig {
         val region = parts[1].uppercase()
         return "$lang-$region"
     }
+
+    data class ActiveSession(
+        val filePath: String = "",
+        val isVoicemail: Boolean = false,
+        val isCall: Boolean = false,
+        val timestamp: Long = 0L
+    )
+
+    fun isVoicemailPath(path: String?): Boolean {
+        if (path.isNullOrBlank()) return false
+        val lower = path.lowercase(java.util.Locale.ROOT)
+        return lower.contains("/voicemail/") ||
+               lower.contains("hlasová schránka") ||
+               lower.contains("hlasova schranka") ||
+               lower.contains("voicemail")
+    }
+
+    fun isCallPath(path: String?): Boolean {
+        if (path.isNullOrBlank()) return false
+        val lower = path.lowercase(java.util.Locale.ROOT)
+        return lower.contains("/call/") ||
+               lower.contains("hovor ") ||
+               lower.contains("call ")
+    }
+
+    fun recordActiveSession(filePath: String) {
+        try {
+            val isVoicemail = isVoicemailPath(filePath)
+            val isCall = isCallPath(filePath)
+            val json = org.json.JSONObject().apply {
+                put("filePath", filePath)
+                put("isVoicemail", isVoicemail)
+                put("isCall", isCall)
+                put("timestamp", System.currentTimeMillis())
+            }
+            val candidates = listOf(
+                File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/GalaxyAI/active_session.json"),
+                File("/storage/emulated/0/GalaxyAI/active_session.json"),
+                File("/data/local/tmp/galaxyai_active_session.json")
+            )
+            for (f in candidates) {
+                try {
+                    f.parentFile?.mkdirs()
+                    f.writeText(json.toString())
+                    Log.i(TAG, "[Config] Aktivní relace zaznamenána: $filePath (isVoicemail=$isVoicemail, isCall=$isCall) do ${f.absolutePath}")
+                    break
+                } catch (_: Throwable) {}
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "[Config] Nelze zaznamenat aktivní relaci: ${t.message}")
+        }
+    }
+
+    fun getActiveSession(): ActiveSession? {
+        val candidates = listOf(
+            File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/GalaxyAI/active_session.json"),
+            File("/storage/emulated/0/GalaxyAI/active_session.json"),
+            File("/data/local/tmp/galaxyai_active_session.json")
+        )
+        for (f in candidates) {
+            try {
+                if (f.exists() && f.canRead()) {
+                    val text = f.readText()
+                    val json = org.json.JSONObject(text)
+                    val ts = json.optLong("timestamp", 0L)
+                    if (System.currentTimeMillis() - ts < 60000L) {
+                        return ActiveSession(
+                            filePath = json.optString("filePath", ""),
+                            isVoicemail = json.optBoolean("isVoicemail", false),
+                            isCall = json.optBoolean("isCall", false),
+                            timestamp = ts
+                        )
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
 }

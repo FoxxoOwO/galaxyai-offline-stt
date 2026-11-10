@@ -222,7 +222,20 @@ object IntelliVoiceHook {
                             Log.i(TAG, "[IntelliVoice] PipeUserChannel.prepare: Oficiální jazyk Samsungu ($detectedLocale), ponechávám bundle beze změny.")
                         }
 
+                        val activeSession = ModuleConfig.getActiveSession()
+                        val isVoicemail = (activeSession?.isVoicemail == true) || bundle.keySet().any { key ->
+                            val v = bundle.getString(key) ?: ""
+                            ModuleConfig.isVoicemailPath(v)
+                        }
+                        val isCall = (activeSession?.isCall == true) || bundle.keySet().any { key ->
+                            val v = bundle.getString(key) ?: ""
+                            ModuleConfig.isCallPath(v)
+                        }
+
                         XposedHelpers.setAdditionalInstanceField(param.thisObject, "requested_locale", detectedLocale)
+                        XposedHelpers.setAdditionalInstanceField(param.thisObject, "is_voicemail", isVoicemail)
+                        XposedHelpers.setAdditionalInstanceField(param.thisObject, "is_call", isCall)
+                        Log.i(TAG, "[IntelliVoice] PipeUserChannel.prepare: isVoicemail=$isVoicemail, isCall=$isCall (session: ${activeSession?.filePath})")
                     }
                 }
             )
@@ -238,6 +251,10 @@ object IntelliVoiceHook {
                         val pfd = param.args[0] as? ParcelFileDescriptor ?: return
                         val listener = param.args[1] ?: return
                         val requestedLocale = XposedHelpers.getAdditionalInstanceField(param.thisObject, "requested_locale") as? String
+                        val isVoicemail = (XposedHelpers.getAdditionalInstanceField(param.thisObject, "is_voicemail") as? Boolean)
+                            ?: (ModuleConfig.getActiveSession()?.isVoicemail == true)
+                        val isCall = (XposedHelpers.getAdditionalInstanceField(param.thisObject, "is_call") as? Boolean)
+                            ?: (ModuleConfig.getActiveSession()?.isCall == true)
 
                         val config = ModuleConfig.load()
                         val req = requestedLocale?.replace("_", "-") ?: ""
@@ -261,14 +278,14 @@ object IntelliVoiceHook {
                                 it.substringBefore("-").equals(systemLocale.substringBefore("-"), ignoreCase = true)
                             }
                             ?: config.enabledLocales.firstOrNull() ?: "cs-CZ"
-                        Log.i(TAG, "[IntelliVoice] PipeUserChannel.write ZACHYCENO! Cílový jazyk: $targetLocale (původní req: '$requestedLocale')")
+                        Log.i(TAG, "[IntelliVoice] PipeUserChannel.write ZACHYCENO! Cílový jazyk: $targetLocale (req: '$requestedLocale', isVoicemail=$isVoicemail, isCall=$isCall)")
                         Log.i(TAG, "[IntelliVoice] Přesměrovávám PCM stream do lokálního Whisper enginu...")
 
                         val pcmInputStream: InputStream = ParcelFileDescriptor.AutoCloseInputStream(pfd)
 
                         sttScope.launch {
                             try {
-                                processSpeechToText(pcmInputStream, listener, targetLocale)
+                                processSpeechToText(pcmInputStream, listener, targetLocale, isVoicemail = isVoicemail, isCall = isCall)
                             } catch (e: Exception) {
                                 Log.e(TAG, "[IntelliVoice] Chyba při přepisu: ", e)
                                 notifyError(listener, 4, e.message ?: "Chyba lokálního STT")
@@ -286,13 +303,19 @@ object IntelliVoiceHook {
         }
     }
 
-    private suspend fun processSpeechToText(inputStream: InputStream, listener: Any, localeTag: String) {
+    private suspend fun processSpeechToText(
+        inputStream: InputStream,
+        listener: Any,
+        localeTag: String,
+        isVoicemail: Boolean = false,
+        isCall: Boolean = false
+    ) {
         // Čtení z pipe nesmí selhat na tom, že zapisující strana ukončila proud
         // (ParcelFileDescriptor vyhodí "Remote side is dead"). I tak může být
         // v bufferu celá nahrávka, proto čteme po částech a výjimku ukončuje jen
         // jako konec dat.
         val pcmBytes = readAllTolerant(inputStream)
-        Log.i(TAG, "[IntelliVoice] Načteno ${pcmBytes.size} bytů audio dat pro jazyk $localeTag.")
+        Log.i(TAG, "[IntelliVoice] Načteno ${pcmBytes.size} bytů audio dat pro jazyk $localeTag (isVoicemail=$isVoicemail, isCall=$isCall).")
         if (pcmBytes.size < 3200) { // méně než 100 ms při 16 kHz / 16 bit
             Log.w(TAG, "[IntelliVoice] Příliš málo audio dat (${pcmBytes.size} bytů), ruším přepis.")
             notifyError(listener, 4, "Nahrávka neobsahuje dostatek audio dat")
@@ -316,9 +339,14 @@ object IntelliVoiceHook {
             }
         } catch (_: Throwable) {}
 
-        // Přepis s lokálním Whisper enginem (využívá sherpa-onnx / Pyannote pro diarizaci,
-        // bez volání nestabilního Samsung diarizéru, který způsoboval pád služby)
-        val sttResult = SttEngineManager.transcribe(pcmBytes, localeTag, null)
+        // Přepis s lokálním Whisper enginem (s podporou hlasové schránky a optimalizovaným slučováním oken)
+        val sttResult = SttEngineManager.transcribe(
+            pcmBytes = pcmBytes,
+            localeTag = localeTag,
+            externalSegments = null,
+            isVoicemail = isVoicemail,
+            isCall = isCall
+        )
 
         Log.i(TAG, "[IntelliVoice] Přepis [$localeTag] dokončen: \"${sttResult.text}\" (${sttResult.words.size} slov v ${sttResult.sentences.size} segmentech, mluvčí: ${sttResult.segments.map { it.speakerId }.distinct()})")
 
