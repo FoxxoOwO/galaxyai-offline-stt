@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Galaxy AI Offline STT (LSPosed)</string>
+    <string name="xposed_desc">Multilingual offline speech-to-text (STT) and speaker diarization for Samsung Voice Recorder and Galaxy AI.</string>
+</resources>

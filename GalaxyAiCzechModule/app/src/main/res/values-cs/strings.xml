@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Galaxy AI Offline STT</string>
+    <string name="xposed_desc">Vícejazyčný offline přepis řeči (STT) a detekce mluvčích pro Samsung Záznamník a Galaxy AI.</string>
+</resources>

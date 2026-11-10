@@ -1,0 +1,6 @@
+<resources>
+    <string-array name="xposed_scope">
+        <item>com.samsung.android.intellivoiceservice</item>
+        <item>com.sec.android.app.voicenote</item>
+    </string-array>
+</resources>

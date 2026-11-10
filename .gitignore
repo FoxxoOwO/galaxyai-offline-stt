@@ -1,0 +1,26 @@
+# Gradle & Build Artifacts
+**/build/
+.gradle/
+*.iml
+.idea/
+local.properties
+keystore.properties
+*.apk
+*.aab
+*.ap_
+
+# Large binary dumps, reverse engineering & downloaded model files
+decompile/
+samsung_apks/
+apks/
+models/
+tools/
+frida/
+unsloth-tmp/
+PowerShell*/
+null/
+
+# OS & Environment
+.DS_Store
+Thumbs.db
+*.log
