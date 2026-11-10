@@ -435,5 +435,20 @@ Na základě hlášení pádů („Aplikace Samsung Intelligence Service pravide
    - Sestaveno (`BUILD SUCCESSFUL in 18s`) a nahráno přes ADB do Galaxy S23 Ultra.
    - Tlačítka `Delete` i potvrzovací dialogy živě ověřeny.
 
+---
+
+## 16. Podepsání klíčem z Dokumentů a publikace na GitHub (2026-11-10 19:35)
+
+1. **Podpisový klíč:**
+   - **Cesta:** `C:\Users\Teresa\Documents\key.jks` (alias `key`, heslo `147258` z `key.txt`).
+   - **Certifikát:** CN=Teri, SHA-256 `8d717b39739e433cb4e401c5c48e3173022ce38770f4bf66abc3cc89289a3878`.
+   - **Podepsaný release APK:** `GalaxyAiCzechModule/app/build/outputs/apk/release/app-release.apk` (ověřeno přes `apksigner verify`).
+2. **Bezpečnost:**
+   - Keystore ani hesla nejsou v gitu verzována (`keystore.properties` je v `.gitignore`).
+3. **GitHub repozitář:**
+   - **Repozitář:** [FoxxoOwO/galaxyai-offline-stt](https://github.com/FoxxoOwO/galaxyai-offline-stt) (Public).
+   - **První Release v1.0.0:** [Releases v1.0.0](https://github.com/FoxxoOwO/galaxyai-offline-stt/releases/tag/v1.0.0) s přiloženým podepsaným release APK.
+
+
 
 
