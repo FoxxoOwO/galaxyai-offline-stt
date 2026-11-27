@@ -4,8 +4,12 @@ import android.content.ContentProvider
 import android.content.ContentValues
 import android.database.Cursor
 import android.net.Uri
+import android.os.Binder
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.util.Log
+import cz.galaxyai.lsposed.config.ModelEngine
+import cz.galaxyai.lsposed.config.ModuleConfig
 import java.io.File
 import java.io.FileNotFoundException
 
@@ -14,16 +18,84 @@ class ModelProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "cz.galaxyai.lsposed.modelprovider"
         private const val TAG = "GalaxyAiCzechHook"
+
+        internal val ALLOWED_CALLING_PACKAGES = setOf(
+            "cz.galaxyai.lsposed",
+            "com.samsung.android.intellivoiceservice",
+            "com.sec.android.app.voicenote",
+            "com.samsung.android.app.notes"
+        )
+
+        internal fun isAllowedCallerPackage(pkg: String?): Boolean =
+            pkg != null && pkg in ALLOWED_CALLING_PACKAGES
+
+        internal fun isAllowedRelativePath(relPath: String?): Boolean {
+            if (relPath.isNullOrBlank()) return false
+            if (relPath != relPath.trim()) return false
+            if (relPath.startsWith("/") || relPath.contains('\\') || relPath.contains("..") || relPath.contains('\u0000')) {
+                return false
+            }
+            if (relPath == "config" || relPath == "config.json") return true
+            if (relPath == "speaker/segmentation.onnx" || relPath == "speaker/embedding.onnx") return true
+
+            val parts = relPath.split('/')
+            if (parts.size != 2) return false
+            val dir = parts[0]
+            val fileName = parts[1]
+            if (!dir.startsWith("whisper-")) return false
+            val modelId = dir.removePrefix("whisper-")
+            val model = ModuleConfig.getModelById(modelId) ?: return false
+
+            return when (model.engine) {
+                ModelEngine.CZECH_SPEECH_GGML -> fileName == model.ggmlFileName
+                ModelEngine.SHERPA_ONNX -> fileName == "${model.id}-encoder.int8.onnx" ||
+                    fileName == "${model.id}-decoder.int8.onnx" ||
+                    fileName == "${model.id}-tokens.txt"
+            }
+        }
+
+        internal fun resolveSafeFile(baseDir: File, relPath: String): File? {
+            if (!isAllowedRelativePath(relPath)) return null
+            val canonicalBase = baseDir.canonicalFile
+            val target = File(canonicalBase, relPath).canonicalFile
+            val prefix = canonicalBase.path.let { if (it.endsWith(File.separator)) it else it + File.separator }
+            if (!target.path.startsWith(prefix)) return null
+            return if (target.exists() && target.isFile) target else null
+        }
     }
 
     override fun onCreate(): Boolean = true
 
+    private fun enforceCallerAuthorized() {
+        val pkg = callingPackage
+        if (isAllowedCallerPackage(pkg)) return
+
+        val callingUid = Binder.getCallingUid()
+        if (callingUid == Process.myUid()) return
+
+        val packages = context?.packageManager?.getPackagesForUid(callingUid)
+        if (packages != null && packages.any { isAllowedCallerPackage(it) }) return
+
+        Log.w(TAG, "[ModelProvider] Zamítnut neoprávněný přístup (pkg=$pkg, uid=$callingUid)")
+        throw SecurityException("Unauthorized caller")
+    }
+
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor? {
-        val relPath = uri.path?.removePrefix("/") ?: throw FileNotFoundException("Invalid URI: $uri")
+        if (mode != "r") {
+            throw SecurityException("Only read mode is supported")
+        }
+        enforceCallerAuthorized()
+
+        val relPath = uri.path?.removePrefix("/")
+        if (!isAllowedRelativePath(relPath) || relPath == null) {
+            Log.w(TAG, "[ModelProvider] Zamítnuta nepovolená cesta: ${uri.path}")
+            throw SecurityException("Disallowed path")
+        }
 
         // Konfigurace pro procesy bez přístupu k /storage (viz ModuleConfig.PROVIDER_URI).
         if (relPath == "config" || relPath == "config.json") {
             val candidates = listOf(
+                "/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/GalaxyAI/config.json",
                 "/storage/emulated/0/GalaxyAI/config.json",
                 "/sdcard/GalaxyAI/config.json"
             )
@@ -45,22 +117,29 @@ class ModelProvider : ContentProvider() {
             throw FileNotFoundException("Config not found")
         }
 
-        val baseDir = File("/storage/emulated/0/GalaxyAI/models")
-        val targetFile = File(baseDir, relPath)
-
-        if (targetFile.exists() && targetFile.isFile) {
-            Log.i(TAG, "[ModelProvider] Poskytuji deskriptor pro soubor: ${targetFile.absolutePath} (${targetFile.length()} bytů)")
-            return ParcelFileDescriptor.open(targetFile, ParcelFileDescriptor.MODE_READ_ONLY)
+        val baseDirs = if (relPath.startsWith("speaker/")) {
+            listOf(
+                File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/GalaxyAI/models"),
+                File("/storage/emulated/0/GalaxyAI/models"),
+                File("/sdcard/GalaxyAI/models")
+            )
+        } else {
+            listOf(
+                File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models"),
+                File("/storage/emulated/0/GalaxyAI/models"),
+                File("/sdcard/GalaxyAI/models")
+            )
         }
 
-        val altDir = File("/sdcard/GalaxyAI/models")
-        val altFile = File(altDir, relPath)
-        if (altFile.exists() && altFile.isFile) {
-            Log.i(TAG, "[ModelProvider] Poskytuji deskriptor pro soubor: ${altFile.absolutePath} (${altFile.length()} bytů)")
-            return ParcelFileDescriptor.open(altFile, ParcelFileDescriptor.MODE_READ_ONLY)
+        for (baseDir in baseDirs) {
+            val resolved = resolveSafeFile(baseDir, relPath)
+            if (resolved != null) {
+                Log.i(TAG, "[ModelProvider] Poskytuji deskriptor pro soubor: ${resolved.name} (${resolved.length()} bytů)")
+                return ParcelFileDescriptor.open(resolved, ParcelFileDescriptor.MODE_READ_ONLY)
+            }
         }
 
-        Log.e(TAG, "[ModelProvider] Soubor nenalezen: $relPath (hledáno v ${targetFile.absolutePath})")
+        Log.e(TAG, "[ModelProvider] Soubor nenalezen: $relPath")
         throw FileNotFoundException("Model file not found: $relPath")
     }
 

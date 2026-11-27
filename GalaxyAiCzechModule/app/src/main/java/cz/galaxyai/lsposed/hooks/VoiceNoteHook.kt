@@ -33,7 +33,7 @@ object VoiceNoteHook {
             val handler = object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val filePath = param.args.getOrNull(1) as? String ?: return
-                    Log.i(TAG, "[VoiceNote] FastConvert zaznamenán pro: $filePath")
+                    Log.i(TAG, "[VoiceNote] FastConvert zaznamenán pro: ${java.io.File(filePath).name}")
                     ModuleConfig.recordActiveSession(filePath)
                 }
             }
@@ -177,8 +177,8 @@ object VoiceNoteHook {
             // { speechInfoList.addAll(dialogInfo.getSpeakerInfos()) }`). Proto musí být
             // OBA příznaky true, jinak Diktafon naše mluvčí ignoruje a vždy vypíše „Mluvčí 0“.
             //
-            // Samsungí diarizér v IntelliVoice Services tím nezapneme – ten se ovládá
-            // bundlem `enable_speaker_diarisation`, který v `prepare()` natvrdo vypínáme.
+            // Všechny požadované jazyky směřují do lokálního enginu IntelliVoiceHook, ale pro
+            // předání DialogInfo do UI Diktafonu musí zůstat oba příznaky zapnuté.
             try {
                 val aiFeatureClass = XposedHelpers.findClass("com.sec.android.app.voicenote.common.util.AiFeature", classLoader)
                 XposedHelpers.findAndHookMethod(

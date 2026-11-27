@@ -11,11 +11,11 @@ Also check out [S23 Enhancer](https://github.com/FoxxoOwO/s23-ultimate)
 
 ### 1. Overview
 
-**Galaxy AI Offline STT** is an LSPosed / Zygisk framework module designed for modern Samsung Galaxy devices running One UI 6.1+ (Android 14+). It provides fully offline, on-device Speech-to-Text (STT) transcription and multi-speaker diarization for **Samsung Voice Recorder** (`com.sec.android.app.voicenote`) and **Samsung Intelligence Service** (`com.samsung.android.intellivoiceservice`).
+**Galaxy AI Offline STT** is an LSPosed / Zygisk framework module designed for modern Samsung Galaxy devices running One UI 6.1+ (Android 14+). It provides fully offline, on-device Speech-to-Text (STT) transcription and multi-speaker diarization for **Samsung Voice Recorder** (`com.sec.android.app.voicenote`), **Samsung Notes / Note Assist** (`com.samsung.android.app.notes`), and **Samsung Intelligence Service** (`com.samsung.android.intellivoiceservice`).
 
 While Samsung's official Galaxy AI offline transcription is limited to a few selected languages and often hangs on certain regional models without cloud access, this project enables:
-- **Czech (Čeština)** and any other Whisper-supported language directly in the native Voice Recorder UI.
-- Offline transcription via quantized **OpenAI Whisper** models (`turbo`, `small`, `base`, `tiny`) executed through **Sherpa-ONNX** and **ONNX Runtime Mobile**.
+- **Czech (Čeština)** and any other Whisper-supported language directly in the native Voice Recorder and Samsung Notes (Note Assist / Auto transcribe) UI.
+- Offline transcription via **[CzechSpeech q4_0](https://huggingface.co/moravianai/CzechSpeech)** (452 MiB, `whisper.cpp` with ARM `i8mm` acceleration — state-of-the-art accuracy for Czech) and quantized **OpenAI Whisper** models (`turbo`, `small`, `base`, `tiny`) executed through **Sherpa-ONNX** and **ONNX Runtime Mobile** (with automatic fallback for non-Czech languages).
 - **Speaker Diarization** (speaker avatars, colored speech bubbles, and word-level timestamps) rendered directly in the native One UI interface.
 - **100% Non-destructive & Systemless**: Absolutely zero files are modified or written to `/system`, `/vendor`, or any read-only partition. All models, configurations, and logs live in standard Android user storage (`/storage/emulated/0/`).
 
@@ -53,9 +53,9 @@ The module operates across two distinct process boundaries via LSPosed hooks:
 +-----------------------------------------------------------------------------------+
 ```
 
-1. **UI Injection (`VoiceNoteHook.kt`):**
-   - Hooks `AsrLanguageHelper.getSupportLanguageList` and related configuration methods in `com.sec.android.app.voicenote`.
-   - Injects Czech (`cs-CZ`) and custom languages into the native language selection dialog, marking them as downloaded and ready for offline use.
+1. **UI Injection (`VoiceNoteHook.kt` & `SamsungNotesHook.kt`):**
+   - Hooks `AsrLanguageHelper` in `com.sec.android.app.voicenote` and `STTLanguageManager` / `ScsUtils` / Auto-transcribe language picker in `com.samsung.android.app.notes` (Note Assist).
+   - Injects Czech (`cs-CZ`) and custom languages into native language pickers (and Samsung Notes Auto transcribe settings), marking them as downloaded and ready for offline use.
 
 2. **Audio Interception (`IntelliVoiceHook.kt`):**
    - Intercepts `PipeUserChannel.write` in the `com.samsung.android.intellivoiceservice:asr` process.
@@ -66,9 +66,9 @@ The module operates across two distinct process boundaries via LSPosed hooks:
    - Applies software **Automatic Gain Control (AGC)** to normalize low-volume microphone recordings.
    - For audio longer than 30 seconds, runs an optimized energy-based **Voice Activity Detection (VAD)** and spectral centroid acoustic clustering that finishes in **15–30 milliseconds** on CPU. This avoids the CPU exhaustion that unquantized neural diarizers (such as full Pyannote 3.0) cause on mobile processors.
 
-4. **Transcription (`Sherpa-ONNX`):**
-   - Transcribes audio windows sequentially using 4 CPU threads with INT8 quantized Whisper ONNX models.
-   - Extracts millisecond-accurate word start/end timestamps from token-level alignment.
+4. **Transcription (`CzechSpeech whisper.cpp` / `Sherpa-ONNX`):**
+   - When `CzechSpeech q4_0` is selected for Czech (`cs`), transcribes locally via `whisper.cpp` (`ggml` q4_0 with ARM `i8mm` repacking and `min_audio_ctx = 512`), reporting 1.9% WER on parliament speech, 7.7% on Czech FLEURS, and 6.8% in noisy environments. Non-Czech languages automatically fall back to any installed Whisper ONNX model.
+   - For multilingual ONNX models (`turbo`, `small`, `base`, `tiny`), transcribes sequentially using CPU threads with INT8 quantized Whisper ONNX models and extracts token-level timestamps.
 
 5. **One UI Result Mapping:**
    - Wraps sentences and words into Samsung's proprietary `DialogInfo` and `Dialog` parcelable hierarchy.
@@ -109,23 +109,27 @@ Benchmarks recorded on a **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2 for Ga
      ```
 2. **Enable in LSPosed:**
    - Open the **LSPosed Manager**.
-   - Enable the **Galaxy AI Czech** module.
+   - Enable the **Galaxy AI Offline STT** module.
    - Ensure the following applications are checked in the scope:
      - `Samsung Voice Recorder` (`com.sec.android.app.voicenote`)
+     - `Samsung Notes` (`com.samsung.android.app.notes`)
      - `Samsung Intelligence Service` (`com.samsung.android.intellivoiceservice`)
 3. **Place Model Files:**
-   - Store the Whisper ONNX model files in the app-accessible media storage directory:
+   - Open the **Galaxy AI Offline STT** companion app to download **CzechSpeech q4_0 (452 MB)** or any Whisper ONNX model (`turbo`, `small`, `base`, `tiny`), switch between them, or delete unused models to free up storage space.
+   - Or manually place the model files in `/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/`:
      ```
-     /storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/whisper-turbo/
+     whisper-czechspeech/
+       └── ggml-czechspeech-q4_0.bin
+     whisper-turbo/
        ├── turbo-encoder.int8.onnx
        ├── turbo-decoder.int8.onnx
        └── turbo-tokens.txt
      ```
-   - Alternatively, open the **Galaxy AI Offline STT** companion app to configure active models, trigger automated downloads, or delete unused models to free up storage space.
 4. **Restart Target Services:**
-   - Force-stop both applications to apply the hook:
+   - Force-stop the target applications to apply the hook:
      ```bash
      adb shell am force-stop com.sec.android.app.voicenote
+     adb shell am force-stop com.samsung.android.app.notes
      adb shell am force-stop com.samsung.android.intellivoiceservice
      ```
 
@@ -140,7 +144,7 @@ Benchmarks recorded on a **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2 for Ga
 #### 2. "Přepis se nezdařil. Zkontrolujte stažení modelu v aplikaci"
 - **Cause:** The Whisper model files could not be found or loaded by `SttEngineManager`.
 - **Solution:**
-  - Verify that the three model files (`*-encoder.int8.onnx`, `*-decoder.int8.onnx`, `*-tokens.txt`) exist in `/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/<model-id>/`.
+  - Verify that the model files exist in `/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/whisper-<model-id>/` (i.e. `*-encoder.int8.onnx`, `*-decoder.int8.onnx`, and `*-tokens.txt` for Whisper ONNX, or `ggml-czechspeech-q4_0.bin` in `whisper-czechspeech/` for CzechSpeech).
   - Check file permissions to ensure they are readable.
 
 #### 3. Native library execution error (`dlopen failed: noexec`)
@@ -151,6 +155,10 @@ Benchmarks recorded on a **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2 for Ga
 - **Cause:** Older versions redirected official Samsung languages (like English `en-US`) back to Samsung's proprietary `SDFileConsumer` engine, which indefinitely hangs on some firmware versions.
 - **Solution:** Current module versions route all requested languages through Whisper. Set the desired language in Voice Recorder and Whisper will decode it locally.
 
+### 6. Licenses & Attribution (CzechSpeech)
+- **Model weights (`moravianai/CzechSpeech`):** © 2026 Jan Rosecký (Moravian AI), dual-licensed — free for non-commercial use under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/); commercial license available via `info@moravian.ai`.
+- **Android native runtime (`ai.moravian:czechspeech-android`):** Required Notice: Copyright (c) 2026 Jan Rosecký (Moravian AI) (https://moravian.ai/czechspeech/), free for noncommercial use under the PolyForm Noncommercial License 1.0.0.
+
 ---
 ---
 
@@ -159,11 +167,11 @@ Benchmarks recorded on a **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2 for Ga
 
 ### 1. Přehled projektu
 
-**Galaxy AI Offline STT** je modul pro LSPosed / Zygisk určený pro telefony Samsung Galaxy s nadstavbou One UI 6.1+ (Android 14+). Umožňuje plnohodnotný **offline přepis řeči na text (STT)** a **rozpoznávání mluvčích (diarizaci)** přímo v nativní systémové aplikaci **Samsung Záznamník** (`com.sec.android.app.voicenote`) a systémové službě **Samsung Intelligence Service** (`com.samsung.android.intellivoiceservice`).
+**Galaxy AI Offline STT** je modul pro LSPosed / Zygisk určený pro telefony Samsung Galaxy s nadstavbou One UI 6.1+ (Android 14+). Umožňuje plnohodnotný **offline přepis řeči na text (STT)** a **rozpoznávání mluvčích (diarizaci)** přímo v nativních systémových aplikacích **Samsung Záznamník** (`com.sec.android.app.voicenote`), **Samsung Notes / Poznámkový asistent** (`com.samsung.android.app.notes`) a systémové službě **Samsung Intelligence Service** (`com.samsung.android.intellivoiceservice`).
 
 Zatímco oficiální Galaxy AI od Samsungu offline češtinu dosud nenabízí a oficiální jazyky na některých modelech zamrzají na 0 %, tento modul přináší:
-- **Plnou podporu češtiny** (a dalších jazyků) přímo v oficiálním dialogu výběru jazyků v Záznamníku.
-- Lokální offline přepis pomocí kvantizovaných modelů **OpenAI Whisper** (`turbo`, `small`, `base`, `tiny`) přes **Sherpa-ONNX** a **ONNX Runtime Mobile**.
+- **Plnou podporu češtiny** (a dalších jazyků) přímo v oficiálním dialogu výběru jazyků v Záznamníku i v Poznámkovém asistentu v Samsung Notes (včetně automatického přepisu nahrávek).
+- Lokální offline přepis pomocí modelu **[CzechSpeech q4_0](https://huggingface.co/moravianai/CzechSpeech)** (452 MiB, `whisper.cpp` s ARM `i8mm` akcelerací — špičková přesnost pro češtinu) a kvantizovaných modelů **OpenAI Whisper** (`turbo`, `small`, `base`, `tiny`) přes **Sherpa-ONNX** a **ONNX Runtime Mobile** (s automatickým fallbackem pro ostatní jazyky).
 - **Detekci mluvčích** (barevné bubliny, ikony/avatary mluvčích a časování jednotlivých slov) integrovanou do originálního grafického rozhraní One UI.
 - **100% bezpečné a bezzásahové řešení**: Modul **nijak neupravuje systémové oddíly** (`/system`, `/vendor` atd.). Veškeré modely, konfigurace a data jsou uloženy v běžném uživatelském úložišti (`/storage/emulated/0/`).
 
@@ -201,9 +209,9 @@ Modul propojuje dvě aplikace pomocí hooků přes LSPosed:
 +-----------------------------------------------------------------------------------+
 ```
 
-1. **Injekce do rozhraní Záznamníku (`VoiceNoteHook.kt`):**
-   - Zachytává metody třídy `AsrLanguageHelper` v aplikaci Záznamník.
-   - Do nabídky jazyků přidá češtinu (`cs-CZ`), nastaví příznaky, že je jazyk stažen a připraven k offline použití.
+1. **Injekce do rozhraní (`VoiceNoteHook.kt` a `SamsungNotesHook.kt`):**
+   - Zachytává metody třídy `AsrLanguageHelper` v aplikaci Záznamník a `STTLanguageManager` / `ScsUtils` / výběr jazyka pro Automatický přepis v aplikaci Samsung Notes (`com.samsung.android.app.notes`).
+   - Do nabídky jazyků přidá češtinu (`cs-CZ`) a další povolené jazyky a označí je jako stažené a připravené k offline použití.
 
 2. **Zachycení audio proudu (`IntelliVoiceHook.kt`):**
    - V procesu `com.samsung.android.intellivoiceservice:asr` odchytává volání `PipeUserChannel.write`.
@@ -214,9 +222,9 @@ Modul propojuje dvě aplikace pomocí hooků přes LSPosed:
    - Aplikuje softwarový zisk (**AGC**), aby byly spolehlivě rozpoznány i tiché nahrávky.
    - Pro nahrávky delší než 30 sekund spouští optimalizovanou **VAD detekci řeči** a shlukování podle spektrálního těžiště, které na procesoru telefonu proběhne za **15 až 30 milisekund**. Tím se eliminuje zamrzání telefonu, které způsobovala těžká neurální diarizace (Pyannote).
 
-4. **Přepis pomocí Whisperu (`Sherpa-ONNX`):**
-   - Rozpoznává řeč po segmentech na 4 vláknech procesoru za použití INT8 kvantizovaných ONNX modelů.
-   - Získává přesná časová razítka pro každé slovo.
+4. **Přepis (`CzechSpeech whisper.cpp` / `Sherpa-ONNX`):**
+   - Při zvolení `CzechSpeech q4_0` pro češtinu (`cs`) probíhá přepis lokálně přes `whisper.cpp` (`ggml` q4_0 s ARM `i8mm` akcelerací a `min_audio_ctx = 512`), s chybovostí WER pouhých 1,9 % na parlamentní řeči, 7,7 % na FLEURS a 6,8 % v šumu. Ostatní jazyky automaticky použijí nainstalovaný vícejazyčný Whisper ONNX model.
+   - Pro modely OpenAI Whisper (`turbo`, `small`, `base`, `tiny`) rozpoznává řeč po segmentech na vláknech procesoru za použití INT8 kvantizovaných ONNX modelů a získává přesná časová razítka pro každé slovo.
 
 5. **Zobrazení v One UI:**
    - Výsledky zabalí do Samsung parcelable tříd `DialogInfo` a `Dialog`.
@@ -258,20 +266,24 @@ Testováno na telefonu **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2 for Gala
    - Povolte modul **Galaxy AI Offline STT**.
    - V seznamu aplikací zkontrolujte zaškrtnutí:
      - `Samsung Záznamník` (`com.sec.android.app.voicenote`)
+     - `Samsung Notes` (`com.samsung.android.app.notes`)
      - `Samsung Intelligence Service` (`com.samsung.android.intellivoiceservice`)
 3. **Nahrání modelů:**
-   - Nahrajte soubory modelu Whisper do složky:
+   - Použijte doprovodnou aplikaci **Galaxy AI Offline STT**, kde lze stáhnout **CzechSpeech q4_0 (452 MB)** nebo libovolný Whisper ONNX model (`turbo`, `small`, `base`, `tiny`), modely přepínat i mazat pro uvolnění místa v úložišti.
+   - Případně nahrajte soubory ručně do složky `/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/`:
      ```
-     /storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/whisper-turbo/
+     whisper-czechspeech/
+       └── ggml-czechspeech-q4_0.bin
+     whisper-turbo/
        ├── turbo-encoder.int8.onnx
        ├── turbo-decoder.int8.onnx
        └── turbo-tokens.txt
      ```
-   - Případně použijte doprovodnou aplikaci **Galaxy AI Offline STT**, kde lze modely pohodlně stahovat, přepínat i mazat pro uvolnění místa v úložišti.
 4. **Restart služeb:**
    - Ukončete aplikace, aby se načetl nový kód:
      ```bash
      adb shell am force-stop com.sec.android.app.voicenote
+     adb shell am force-stop com.samsung.android.app.notes
      adb shell am force-stop com.samsung.android.intellivoiceservice
      ```
 
@@ -285,7 +297,7 @@ Testováno na telefonu **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2 for Gala
 
 #### 2. Text v záznamu „Přepis se nezdařil. Zkontrolujte stažení modelu v aplikaci“
 - **Příčina:** Modulu se nepodařilo načíst soubory modelu Whisper (soubory chybí nebo jsou poškozené).
-- **Řešení:** Zkontrolujte, zda v `/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/<id_modelu>/` skutečně existují všechny 3 soubory (`*-encoder.int8.onnx`, `*-decoder.int8.onnx`, `*-tokens.txt`).
+- **Řešení:** Zkontrolujte, zda v `/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/whisper-<id_modelu>/` skutečně existují všechny soubory modelu (`*-encoder.int8.onnx`, `*-decoder.int8.onnx`, `*-tokens.txt` pro Whisper ONNX, nebo `ggml-czechspeech-q4_0.bin` ve složce `whisper-czechspeech/`).
 
 #### 3. Chyba spouštění knihovny (`dlopen failed: noexec`)
 - **Příčina:** Oddíl `/storage/emulated/0/` je jádrem Androidu připojen s příznakem `noexec`, který zakazuje přímé spouštění `.so` knihoven z uživatelského úložiště.
@@ -294,3 +306,7 @@ Testováno na telefonu **Samsung Galaxy S23 Ultra** (Snapdragon 8 Gen 2 for Gala
 #### 4. Přepis se zasekne na 0 %
 - **Příčina:** Starší verze modulu předávaly oficiální jazyky (např. angličtinu) zpět nativnímu enginu Samsungu, který na některých zařízeních trvale zamrzal na `mProgress=0`.
 - **Řešení:** Aktuální verze modulu přepisuje všechny vybrané jazyky lokálně pomocí Whisperu.
+
+### 6. Licence a uvedení autorů (CzechSpeech)
+- **Váhy modelu (`moravianai/CzechSpeech`):** © 2026 Jan Rosecký (Moravian AI), duální licence — zdarma pro nekomerční použití pod [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/); komerční licence je dostupná přes `info@moravian.ai`.
+- **Android runtime (`ai.moravian:czechspeech-android`):** Required Notice: Copyright (c) 2026 Jan Rosecký (Moravian AI) (https://moravian.ai/czechspeech/), zdarma pro nekomerční použití pod PolyForm Noncommercial License 1.0.0.

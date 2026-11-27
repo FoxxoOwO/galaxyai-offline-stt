@@ -16,26 +16,44 @@ data class SupportedLanguage(
     val englishName: String   // e.g. "Czech"
 )
 
+enum class ModelEngine {
+    SHERPA_ONNX,
+    CZECH_SPEECH_GGML
+}
+
 data class ModelInfo(
-    val id: String,           // "turbo", "small", "base"
-    val name: String,         // "Whisper Large-v3-Turbo", ...
-    val sizeMb: Int,          // 1030, 370, 150
-    val encoderUrl: String,
-    val decoderUrl: String,
-    val tokensUrl: String
+    val id: String,           // "czechspeech", "turbo", "small", "base"
+    val name: String,         // "CzechSpeech q4_0 (...)", "Whisper Large-v3-Turbo", ...
+    val sizeMb: Int,          // 452, 1030, 370, 150
+    val engine: ModelEngine = ModelEngine.SHERPA_ONNX,
+    val encoderUrl: String = "",
+    val encoderSizeBytes: Long = 0L,
+    val encoderSha256: String = "",
+    val decoderUrl: String = "",
+    val decoderSizeBytes: Long = 0L,
+    val decoderSha256: String = "",
+    val tokensUrl: String = "",
+    val tokensSizeBytes: Long = 0L,
+    val tokensSha256: String = "",
+    val ggmlUrl: String = "",
+    val ggmlFileName: String = "",
+    val ggmlSizeBytes: Long = 0L,
+    val ggmlSha256: String = "",
+    val supportedWhisperCodes: Set<String>? = null, // null = multilingual
+    val description: String = ""
 )
 
 data class ConfigData(
     var selectedModel: String = "turbo",
     var enabledLocales: MutableList<String> = mutableListOf("cs-CZ", "sk-SK", "uk-UA"),
     /**
-     * Jazyk, který se použije, když VoiceNote nepošle žádný (prázdný locale) – tehdy
-     * se bere jazyk systému, případně první povolený jazyk.
-     *
-     * Pozn.: dřívější přepínač `overrideOfficialLocale` byl odstraněn 2026-11-06.
-     * Modul už nikdy nepřebírá oficiální jazyky Galaxy AI – viz IntelliVoiceHook.write().
+     * Jazyk použitý ve chvíli, kdy volající aplikace nepředá žádné locale
+     * (prázdný řetězec nebo "und") — přednostně se pak použije tento fallback,
+     * případně systémový jazyk nebo první povolený jazyk v konfiguraci.
      */
-    var fallbackLocale: String? = null
+    var fallbackLocale: String? = null,
+    /** Diagnostické logování obsahu přepisu a ukládání last_recording.wav (výchozí vypnuto). */
+    var debugLogging: Boolean = false
 )
 
 object ModuleConfig {
@@ -66,44 +84,84 @@ object ModuleConfig {
 
     val MODELS = listOf(
         ModelInfo(
+            id = "czechspeech",
+            name = "CzechSpeech q4_0 (Moravian AI, Czech)",
+            sizeMb = 452,
+            engine = ModelEngine.CZECH_SPEECH_GGML,
+            ggmlUrl = "https://huggingface.co/moravianai/CzechSpeech/resolve/a4e21bbf9c143d3cfa42488472fed79e9eeba8a9/ggml-czechspeech-q4_0.bin",
+            ggmlFileName = "ggml-czechspeech-q4_0.bin",
+            ggmlSizeBytes = 473_992_235L,
+            ggmlSha256 = "04ead6662325354947015bba8604c0e3fbfb9fee598bca1d98340834cb8330a3",
+            supportedWhisperCodes = setOf("cs"),
+            description = "Best accuracy & speed for Czech (whisper.cpp q4_0, CC BY-NC 4.0). Non-Czech languages fall back to any installed Whisper model."
+        ),
+        ModelInfo(
             id = "turbo",
             name = "Whisper Large-v3-Turbo (800M)",
             sizeMb = 1030,
-            encoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo/resolve/main/turbo-encoder.int8.onnx",
-            decoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo/resolve/main/turbo-decoder.int8.onnx",
-            tokensUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo/resolve/main/turbo-tokens.txt"
+            encoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo/resolve/2ca6ff69fc878651b770880507669577ac41c2ff/turbo-encoder.int8.onnx",
+            encoderSizeBytes = 674_716_297L,
+            encoderSha256 = "b02dcdf54f348741e93fe732b67d933c8dcb6735655f710640143081db38878b",
+            decoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo/resolve/2ca6ff69fc878651b770880507669577ac41c2ff/turbo-decoder.int8.onnx",
+            decoderSizeBytes = 361_080_764L,
+            decoderSha256 = "20accd02388482eb3a46bd615631adfdc85e1eb2c7db9ea3f02a40ffe6b81547",
+            tokensUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo/resolve/2ca6ff69fc878651b770880507669577ac41c2ff/turbo-tokens.txt",
+            tokensSizeBytes = 816_730L,
+            tokensSha256 = "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126"
         ),
         ModelInfo(
             id = "small",
             name = "Whisper Small (244M)",
             sizeMb = 370,
-            encoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-encoder.int8.onnx",
-            decoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-decoder.int8.onnx",
-            tokensUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/main/small-tokens.txt"
+            encoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/8f3c18b358db4d1f2fc1eae49d75cd20989e4309/small-encoder.int8.onnx",
+            encoderSizeBytes = 112_442_483L,
+            encoderSha256 = "4cbe7b22fa9026b843b60a68640c747de05bafb1a11b57edc0e66c232d9f33a9",
+            decoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/8f3c18b358db4d1f2fc1eae49d75cd20989e4309/small-decoder.int8.onnx",
+            decoderSizeBytes = 262_226_114L,
+            decoderSha256 = "acad50b5c782696e91b55914cc5ab4f756f1532f76e22aa6fc615f39fb69a8ee",
+            tokensUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-small/resolve/8f3c18b358db4d1f2fc1eae49d75cd20989e4309/small-tokens.txt",
+            tokensSizeBytes = 816_730L,
+            tokensSha256 = "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126"
         ),
         ModelInfo(
             id = "base",
             name = "Whisper Base (74M)",
             sizeMb = 150,
-            encoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/main/base-encoder.int8.onnx",
-            decoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/main/base-decoder.int8.onnx",
-            tokensUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/main/base-tokens.txt"
+            encoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/bb53ee204431c90d314c1cc08d28d23e5b7927cc/base-encoder.int8.onnx",
+            encoderSizeBytes = 29_120_534L,
+            encoderSha256 = "0b8fb1304b6109976038efff5ace81720e00386f3ff6b54ee8c75291ca0a1e11",
+            decoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/bb53ee204431c90d314c1cc08d28d23e5b7927cc/base-decoder.int8.onnx",
+            decoderSizeBytes = 130_672_026L,
+            decoderSha256 = "9759d217388a01b3a4c7c15533201067b48ae819c4daafc8624e64b9409dc02d",
+            tokensUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base/resolve/bb53ee204431c90d314c1cc08d28d23e5b7927cc/base-tokens.txt",
+            tokensSizeBytes = 816_730L,
+            tokensSha256 = "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126"
         ),
         ModelInfo(
             id = "tiny",
             name = "Whisper Tiny (39M)",
             sizeMb = 75,
-            encoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-encoder.int8.onnx",
-            decoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-decoder.int8.onnx",
-            tokensUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/main/tiny-tokens.txt"
+            encoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/65176e2deb88badc814a94058666cadccc29b61c/tiny-encoder.int8.onnx",
+            encoderSizeBytes = 12_937_772L,
+            encoderSha256 = "d24fb083ae3b1041fc24e97971d60e280c9342201fbb67b0ab428a8b4a51a434",
+            decoderUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/65176e2deb88badc814a94058666cadccc29b61c/tiny-decoder.int8.onnx",
+            decoderSizeBytes = 89_855_401L,
+            decoderSha256 = "d2fece8dd42771f1df975c6c0445770d0c292bf7547c2cae04a6c0cc57540925",
+            tokensUrl = "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-tiny/resolve/65176e2deb88badc814a94058666cadccc29b61c/tiny-tokens.txt",
+            tokensSizeBytes = 816_730L,
+            tokensSha256 = "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126"
         )
     )
 
     data class DiarizationModelInfo(
         val name: String = "Speaker Diarization Pack (Pyannote 3.0 + ERes2Net)",
         val sizeMb: Int = 45,
-        val segmentationUrl: String = "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx",
-        val embeddingUrl: String = "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+        val segmentationUrl: String = "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/9403a6902bb58e3d5ae8c7e77c3422de279db2e0/model.onnx",
+        val segmentationSizeBytes: Long = 5_992_913L,
+        val segmentationSha256: String = "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
+        val embeddingUrl: String = "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/a8055d6daef723a6a4ecf4de233708575bf4994f/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+        val embeddingSizeBytes: Long = 39_593_762L,
+        val embeddingSha256: String = "f1ee61be04000b50392a63442e5dd9feaea7e81dddd494d3647cf1c3d88a1498"
     )
 
     val DIARIZATION_MODEL = DiarizationModelInfo()
@@ -373,8 +431,6 @@ object ModuleConfig {
             try {
                 f.parentFile?.mkdirs()
                 f.writeText(json)
-                f.setReadable(true, false)
-                f.setWritable(true, false)
                 Log.i(TAG, "[Config] Saved configuration to ${f.absolutePath}")
             } catch (t: Throwable) {
                 Log.e(TAG, "[Config] Error saving to ${f.absolutePath}: ${t.message}")
@@ -389,9 +445,12 @@ object ModuleConfig {
         }
     }
 
+    fun getModelById(modelId: String): ModelInfo? = MODELS.find { it.id == modelId }
+
     fun isModelInstalled(modelId: String): Boolean = getModelDirectory(modelId) != null
 
     fun getModelDirectory(modelId: String): File? {
+        val modelInfo = getModelById(modelId)
         val searchDirs = listOf(
             File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/models/whisper-$modelId"),
             File("/storage/emulated/0/GalaxyAI/models/whisper-$modelId"),
@@ -400,11 +459,18 @@ object ModuleConfig {
         for (dir in searchDirs) {
             try {
                 if (dir.exists()) {
-                    val enc = File(dir, "$modelId-encoder.int8.onnx")
-                    val dec = File(dir, "$modelId-decoder.int8.onnx")
-                    val tok = File(dir, "$modelId-tokens.txt")
-                    if (enc.exists() && enc.length() > 500000 && dec.exists() && dec.length() > 500000 && tok.exists()) {
-                        return dir
+                    if (modelInfo?.engine == ModelEngine.CZECH_SPEECH_GGML) {
+                        val bin = File(dir, modelInfo.ggmlFileName)
+                        if (bin.exists() && bin.length() > 100_000_000L) {
+                            return dir
+                        }
+                    } else {
+                        val enc = File(dir, "$modelId-encoder.int8.onnx")
+                        val dec = File(dir, "$modelId-decoder.int8.onnx")
+                        val tok = File(dir, "$modelId-tokens.txt")
+                        if (enc.exists() && enc.length() > 500000 && dec.exists() && dec.length() > 500000 && tok.exists()) {
+                            return dir
+                        }
                     }
                 }
             } catch (_: Throwable) {}
@@ -454,12 +520,45 @@ object ModuleConfig {
     /** Normalizuje "en_US" i "en-US" na "en-US". */
     fun normalizeLocaleTag(tag: String?): String {
         if (tag.isNullOrBlank()) return ""
-        val parts = tag.replace("_", "-").split("-")
+        val parts = tag.trim().replace("_", "-").split("-")
         if (parts.isEmpty()) return ""
-        val lang = parts[0].lowercase()
-        if (parts.size == 1) return lang
-        val region = parts[1].uppercase()
+        val lang = parts[0].lowercase(java.util.Locale.ROOT)
+        if (lang.isBlank()) return ""
+        if (parts.size == 1 || parts[1].isBlank()) return lang
+        val region = parts[1].uppercase(java.util.Locale.ROOT)
         return "$lang-$region"
+    }
+
+    /** Najde odpovídající povolený jazyk bez rizika kolize prefixu u prázdného vstupu. */
+    fun matchEnabledLocale(raw: String?, enabledLocales: List<String>): String? {
+        val normalized = normalizeLocaleTag(raw)
+        if (normalized.isBlank() || normalized.equals("und", ignoreCase = true)) return null
+        val exact = enabledLocales.find { it.equals(normalized, ignoreCase = true) }
+        if (exact != null) return exact
+        val primary = normalized.substringBefore("-")
+        if (primary.isBlank() || primary.equals("und", ignoreCase = true)) return null
+        return enabledLocales.find { it.substringBefore("-").equals(primary, ignoreCase = true) }
+    }
+
+    /** Určí finální cílový jazyk přepisu podle požadavku, fallbacku a systémového locale. */
+    fun resolveTargetLocale(
+        requestedLocale: String?,
+        enabledLocales: List<String>,
+        fallbackLocale: String?,
+        systemLocale: String
+    ): String {
+        val normalizedReq = normalizeLocaleTag(requestedLocale)
+        val hasReq = normalizedReq.isNotBlank() && !normalizedReq.equals("und", ignoreCase = true)
+        if (hasReq) {
+            return matchEnabledLocale(normalizedReq, enabledLocales) ?: normalizedReq
+        }
+        val normalizedFallback = normalizeLocaleTag(fallbackLocale)
+        if (normalizedFallback.isNotBlank() && !normalizedFallback.equals("und", ignoreCase = true)) {
+            return matchEnabledLocale(normalizedFallback, enabledLocales) ?: normalizedFallback
+        }
+        return matchEnabledLocale(systemLocale, enabledLocales)
+            ?: enabledLocales.firstOrNull()
+            ?: "cs-CZ"
     }
 
     data class ActiveSession(
@@ -490,22 +589,22 @@ object ModuleConfig {
         try {
             val isVoicemail = isVoicemailPath(filePath)
             val isCall = isCallPath(filePath)
+            val fileNameOnly = File(filePath).name
             val json = org.json.JSONObject().apply {
-                put("filePath", filePath)
+                put("filePath", fileNameOnly)
                 put("isVoicemail", isVoicemail)
                 put("isCall", isCall)
                 put("timestamp", System.currentTimeMillis())
             }
             val candidates = listOf(
                 File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/GalaxyAI/active_session.json"),
-                File("/storage/emulated/0/GalaxyAI/active_session.json"),
-                File("/data/local/tmp/galaxyai_active_session.json")
+                File("/storage/emulated/0/GalaxyAI/active_session.json")
             )
             for (f in candidates) {
                 try {
                     f.parentFile?.mkdirs()
                     f.writeText(json.toString())
-                    Log.i(TAG, "[Config] Aktivní relace zaznamenána: $filePath (isVoicemail=$isVoicemail, isCall=$isCall) do ${f.absolutePath}")
+                    Log.i(TAG, "[Config] Aktivní relace zaznamenána: $fileNameOnly (isVoicemail=$isVoicemail, isCall=$isCall) do ${f.absolutePath}")
                     break
                 } catch (_: Throwable) {}
             }
@@ -517,8 +616,7 @@ object ModuleConfig {
     fun getActiveSession(): ActiveSession? {
         val candidates = listOf(
             File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/GalaxyAI/active_session.json"),
-            File("/storage/emulated/0/GalaxyAI/active_session.json"),
-            File("/data/local/tmp/galaxyai_active_session.json")
+            File("/storage/emulated/0/GalaxyAI/active_session.json")
         )
         for (f in candidates) {
             try {

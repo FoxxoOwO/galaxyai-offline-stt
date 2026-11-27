@@ -28,6 +28,7 @@ class MainActivity : AppCompatActivity() {
     private val modelRadioButtons = mutableMapOf<String, RadioButton>()
     private val modelStatusTexts = mutableMapOf<String, TextView>()
     private val modelDeleteButtons = mutableMapOf<String, MaterialButton>()
+    private val modelItemRows = mutableMapOf<String, LinearLayout>()
 
     private lateinit var progressBar: ProgressBar
     private lateinit var progressText: TextView
@@ -43,17 +44,20 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         try {
             val uri = Uri.parse("content://cz.galaxyai.lsposed.modelprovider")
-            grantUriPermission(
-                "com.samsung.android.intellivoiceservice",
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
-            )
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+            grantUriPermission("com.samsung.android.intellivoiceservice", uri, flags)
+            grantUriPermission("com.samsung.android.app.notes", uri, flags)
         } catch (_: Throwable) {}
 
         config = ModuleConfig.load()
         val validTags = ModuleConfig.ALL_SUPPORTED_LANGUAGES.map { it.localeTag }.toSet()
-        config.enabledLocales.retainAll(validTags)
-        ModuleConfig.save(config)
+        val removedInvalid = config.enabledLocales.retainAll(validTags)
+        if (config.enabledLocales.isEmpty()) {
+            config.enabledLocales.add("cs-CZ")
+        }
+        if (hasAllFilesAccess() && removedInvalid) {
+            ModuleConfig.save(config)
+        }
         syncActiveModelToMediaDir()
 
         val scrollView = ScrollView(this).apply {
@@ -102,6 +106,53 @@ class MainActivity : AppCompatActivity() {
 
         refreshModelStatuses()
         refreshDiarizationStatus()
+
+        // Bez "All files access" nelze do /storage/emulated/0 zapsat nic – stahování
+        // modelu pak selže s EPERM a uživatel vidí jen obecnou chybu.
+        if (!hasAllFilesAccess()) ensureAllFilesAccess()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Po návratu ze systémových nastavení (přidělení All files access) aktualizovat stav.
+        if (hasAllFilesAccess()) {
+            refreshModelStatuses()
+            refreshDiarizationStatus()
+        }
+    }
+
+    private fun hasAllFilesAccess(): Boolean =
+        android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R ||
+            android.os.Environment.isExternalStorageManager()
+
+    private fun requestAllFilesAccess() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return
+        try {
+            startActivity(
+                Intent(
+                    android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        } catch (_: Throwable) {
+            startActivity(Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+        }
+    }
+
+    private fun ensureAllFilesAccess(onGranted: () -> Unit = {}) {
+        if (hasAllFilesAccess()) {
+            onGranted()
+            return
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("All files access required")
+            .setMessage(
+                "Galaxy AI must write models to /storage/emulated/0 so Samsung IntelliVoice Services can read them. " +
+                    "Allow \"All files access\" for Galaxy AI in the next screen, then tap Download again."
+            )
+            .setPositiveButton("Open settings") { _, _ -> requestAllFilesAccess() }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun createHeader(): View {
@@ -116,7 +167,7 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.parseColor("#1F2937"))
             }
             val sub = TextView(context).apply {
-                text = "Offline Whisper speech recognition for Samsung Voice Recorder"
+                text = "Offline Whisper & CzechSpeech recognition for Samsung Voice Recorder and Samsung Notes (Note Assist)"
                 textSize = 14f
                 setTextColor(Color.parseColor("#4B5563"))
                 setPadding(0, 8, 0, 0)
@@ -145,7 +196,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Required Voice Recorder settings"
+            text = "Required Samsung App Settings"
             textSize = 17f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#92400E"))
@@ -153,7 +204,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(title)
 
         val body = TextView(this).apply {
-            text = "Voice Recorder on One UI requires manual selection for added languages:"
+            text = "How to use added languages in Samsung Voice Recorder and Samsung Notes:"
             textSize = 13f
             setTextColor(Color.parseColor("#78350F"))
             setPadding(0, 10, 0, 12)
@@ -162,9 +213,9 @@ class MainActivity : AppCompatActivity() {
         container.addView(body)
 
         val steps = listOf(
-            "1. Open Samsung Voice Recorder -> three-dot menu -> Settings -> Transcription assistant (\"Asistent přepisu\").",
-            "2. Turn OFF \"Automatically detect language\" (\"Automaticky rozpoznat jazyk\").",
-            "3. In the recording view, tap the stars icon, pick your desired language in the picker, and confirm Transcribe (\"Přepis\")."
+            "1. Voice Recorder: Open Settings -> Transcription assistant, turn OFF \"Automatically detect language\", then pick your language in the recording view.",
+            "2. Samsung Notes (Note Assist): Enable Samsung Notes in LSPosed scope, then pick your language in the Transcribe dialog or Note Assist -> Auto transcribe settings.",
+            "3. All enabled languages (Czech, Slovak, Ukrainian, etc.) are transcribed on-device using local CzechSpeech / Whisper models with speaker diarization."
         )
         for (step in steps) {
             val tv = TextView(this).apply {
@@ -178,7 +229,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val footer = TextView(this).apply {
-            text = "All requested languages (Czech, Slovak, English, German, and more) are transcribed on-device using local Whisper models with accurate speaker diarization for Samsung Voice Recorder."
+            text = "Note: After updating the module, make sure Samsung Voice Recorder, Samsung Notes, and Samsung Intelligence Service are checked in LSPosed Manager."
             textSize = 12f
             setTextColor(Color.parseColor("#A16207"))
             setPadding(0, 16, 0, 0)
@@ -213,7 +264,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#111827"))
         }
         val cardDesc = TextView(this).apply {
-            text = "Select your active Whisper model or download an alternative size:"
+            text = "Select your active offline STT model or download another:"
             textSize = 13f
             setTextColor(Color.parseColor("#6B7280"))
             setPadding(0, 6, 0, 20)
@@ -231,6 +282,7 @@ class MainActivity : AppCompatActivity() {
                     selectModel(model.id)
                 }
             }
+            modelItemRows[model.id] = itemRow
 
             val headerRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -274,6 +326,17 @@ class MainActivity : AppCompatActivity() {
             headerRow.addView(btnRowDelete)
 
             itemRow.addView(headerRow)
+
+            if (model.description.isNotBlank()) {
+                val descTv = TextView(this).apply {
+                    text = model.description
+                    textSize = 11.5f
+                    setTextColor(Color.parseColor("#6B7280"))
+                    setPadding(68, 2, 16, 2)
+                    setLineSpacing(3f, 1f)
+                }
+                itemRow.addView(descTv)
+            }
 
             val statusTv = TextView(this).apply {
                 text = "Checking..."
@@ -439,7 +502,6 @@ class MainActivity : AppCompatActivity() {
                         val dstFile = File(dstDir, file.name)
                         if (!dstFile.exists() || dstFile.length() != file.length()) {
                             file.copyTo(dstFile, overwrite = true)
-                            dstFile.setReadable(true, false)
                         }
                     }
                 }
@@ -464,13 +526,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         val cardTitle = TextView(this).apply {
-            text = "Languages for Samsung Voice Recorder"
+            text = "Enabled Offline Languages"
             textSize = 18f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.parseColor("#111827"))
         }
         val cardDesc = TextView(this).apply {
-            text = "Select the languages to enable in the Voice Recorder picker:"
+            text = "Select the languages to enable in Samsung Voice Recorder and Samsung Notes pickers:"
             textSize = 13f
             setTextColor(Color.parseColor("#6B7280"))
             setPadding(0, 6, 0, 16)
@@ -484,12 +546,21 @@ class MainActivity : AppCompatActivity() {
                 textSize = 14f
                 setTextColor(Color.parseColor("#374151"))
                 isChecked = config.enabledLocales.contains(lang.localeTag)
-                setOnCheckedChangeListener { _, isChecked ->
+                setOnCheckedChangeListener { buttonView, isChecked ->
                     if (isChecked) {
                         if (!config.enabledLocales.contains(lang.localeTag)) {
                             config.enabledLocales.add(lang.localeTag)
                         }
                     } else {
+                        if (config.enabledLocales.size <= 1 && config.enabledLocales.contains(lang.localeTag)) {
+                            buttonView.isChecked = true
+                            Toast.makeText(
+                                this@MainActivity,
+                                "At least one language must remain enabled.",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@setOnCheckedChangeListener
+                        }
                         config.enabledLocales.remove(lang.localeTag)
                     }
                     ModuleConfig.save(config)
@@ -525,14 +596,14 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener {
                 ModuleConfig.save(config)
                 syncActiveModelToMediaDir()
-                Toast.makeText(context, "Settings saved. Restarting Voice Recorder...", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Settings saved. Restarting target services...", Toast.LENGTH_SHORT).show()
                 restartServices()
             }
         }
         container.addView(btnSave)
 
         val hint = TextView(this).apply {
-            text = "Tip: After downloading or switching models, tap Save & Apply to restart Samsung Voice Recorder and IntelliVoice services."
+            text = "Tip: After downloading or switching models, tap Save & Apply to restart Samsung Voice Recorder, Samsung Notes, and IntelliVoice services."
             textSize = 12f
             setTextColor(Color.parseColor("#9CA3AF"))
             setPadding(0, 16, 0, 0)
@@ -613,13 +684,30 @@ class MainActivity : AppCompatActivity() {
 
     private fun startModelDownload() {
         val model = ModuleConfig.MODELS.find { it.id == config.selectedModel } ?: return
+        ensureAllFilesAccess { startModelDownloadInternal(model) }
+    }
 
+    private fun setModelControlsEnabled(enabled: Boolean) {
+        btnDownload.isEnabled = enabled
+        btnDeleteModel.isEnabled = enabled
+        for (row in modelItemRows.values) {
+            row.isEnabled = enabled
+            row.alpha = if (enabled) 1.0f else 0.5f
+        }
+        for (btn in modelDeleteButtons.values) {
+            btn.isEnabled = enabled
+        }
+    }
+
+    private fun startModelDownloadInternal(model: ModelInfo) {
+        var lastStatus = ""
         progressBar.visibility = View.VISIBLE
         progressText.visibility = View.VISIBLE
-        btnDownload.isEnabled = false
+        setModelControlsEnabled(false)
 
         lifecycleScope.launch {
             val success = ModelDownloader.downloadModel(model) { percent, status ->
+                lastStatus = status
                 runOnUiThread {
                     progressBar.progress = percent
                     progressText.text = status
@@ -627,7 +715,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             runOnUiThread {
-                btnDownload.isEnabled = true
+                setModelControlsEnabled(true)
                 progressBar.visibility = View.GONE
                 progressText.visibility = View.GONE
                 if (success) {
@@ -635,19 +723,29 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "Model ${model.name} is ready!", Toast.LENGTH_LONG).show()
                     refreshModelStatuses()
                 } else {
-                    Toast.makeText(this@MainActivity, "Error downloading model.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(
+                        this@MainActivity,
+                        lastStatus.ifBlank { "Error downloading model." },
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             }
         }
     }
 
     private fun startDiarizationDownload() {
+        ensureAllFilesAccess { startDiarizationDownloadInternal() }
+    }
+
+    private fun startDiarizationDownloadInternal() {
+        var lastStatus = ""
         diarizationProgressBar.visibility = View.VISIBLE
         diarizationProgressText.visibility = View.VISIBLE
         btnDiarizationDownload.isEnabled = false
 
         lifecycleScope.launch {
             val success = ModelDownloader.downloadDiarizationModel { percent, status ->
+                lastStatus = status
                 runOnUiThread {
                     diarizationProgressBar.progress = percent
                     diarizationProgressText.text = status
@@ -662,15 +760,38 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "Speaker Diarization Pack ready!", Toast.LENGTH_LONG).show()
                     refreshDiarizationStatus()
                 } else {
-                    Toast.makeText(this@MainActivity, "Error downloading diarization pack.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(
+                        this@MainActivity,
+                        lastStatus.ifBlank { "Error downloading diarization pack." },
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             }
         }
     }
 
     private fun restartServices() {
-        try {
-            Runtime.getRuntime().exec(arrayOf("su", "-c", "am force-stop com.sec.android.app.voicenote && am force-stop com.samsung.android.intellivoiceservice"))
-        } catch (_: Exception) {}
+        lifecycleScope.launch(Dispatchers.IO) {
+            val ok = try {
+                val process = Runtime.getRuntime().exec(
+                    arrayOf(
+                        "su",
+                        "-c",
+                        "am force-stop com.sec.android.app.voicenote && am force-stop com.samsung.android.app.notes && am force-stop com.samsung.android.intellivoiceservice"
+                    )
+                )
+                process.waitFor() == 0
+            } catch (_: Exception) {
+                false
+            }
+            runOnUiThread {
+                val msg = if (ok) {
+                    "Target services restarted."
+                } else {
+                    "Could not restart services automatically (root required). Force-stop them manually."
+                }
+                Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 }

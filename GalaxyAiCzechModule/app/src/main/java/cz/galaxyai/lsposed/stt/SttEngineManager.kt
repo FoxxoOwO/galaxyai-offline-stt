@@ -15,6 +15,7 @@ import com.k2fsa.sherpa.onnx.OfflineSpeakerSegmentationPyannoteModelConfig
 import com.k2fsa.sherpa.onnx.OfflineWhisperModelConfig
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import cz.galaxyai.lsposed.MainHook.Companion.TAG
+import cz.galaxyai.lsposed.config.ModelEngine
 import cz.galaxyai.lsposed.config.ModuleConfig
 import java.io.File
 import java.nio.ByteBuffer
@@ -22,8 +23,8 @@ import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipFile
-import java.util.zip.ZipEntry
 
 data class WordSegment(
     val word: String,
@@ -53,7 +54,7 @@ data class AudioSegment(
 )
 
 /** Slovo s časováním odvozeným z token timestampů Whisperu (přesnější než rovnoměrné dělení). */
-private data class TimedWord(
+internal data class TimedWord(
     val text: String,
     val startMs: Int,
     val endMs: Int
@@ -67,6 +68,8 @@ object SttEngineManager {
     private const val MAX_SPEAKERS = 4
     private const val SPEAKER_EMBEDDING_FILE = "embedding.onnx"
 
+    private val engineLock = Any()
+
     @Volatile
     private var recognizer: OfflineRecognizer? = null
     @Volatile
@@ -76,6 +79,83 @@ object SttEngineManager {
 
     @Volatile
     var isNativeLoaded = false
+
+    @Volatile
+    var isCzechSpeechNativeLoaded = false
+
+    @Volatile
+    private var czechSpeechHandle: Long = 0L
+
+    @Volatile
+    private var czechSpeechModelPath: String? = null
+
+    private val czechSpeechGen = AtomicInteger(0)
+
+    private fun currentApplication(): android.app.Application? {
+        return try {
+            val atClass = Class.forName("android.app.ActivityThread")
+            atClass.getMethod("currentApplication").invoke(null) as? android.app.Application
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun hostTargetLibDir(app: android.app.Application?): File {
+        val cacheDir = app?.cacheDir ?: File("/data/user/0/com.samsung.android.intellivoiceservice/cache")
+        return File(cacheDir, "galaxyai_native_libs").apply { mkdirs() }
+    }
+
+    private fun findModuleApk(app: android.app.Application?): File? {
+        var apkFile: File? = null
+
+        // Metoda 1: Získání z MainHook.modulePath (přímo z Xposed initZygote)
+        if (cz.galaxyai.lsposed.MainHook.modulePath != null) {
+            val f = File(cz.galaxyai.lsposed.MainHook.modulePath!!)
+            if (f.exists()) apkFile = f
+        }
+
+        // Metoda 2: Získání z LspModuleClassLoader řetězce
+        if (apkFile == null) {
+            val clStr = SttEngineManager::class.java.classLoader?.toString() ?: ""
+            val moduleMatch = Regex("module=([^,\\]]+)").find(clStr)
+            if (moduleMatch != null) {
+                val f = File(moduleMatch.groupValues[1].trim())
+                if (f.exists()) apkFile = f
+            }
+        }
+
+        // Metoda 3: Prohledání /data/app
+        if (apkFile == null) {
+            try {
+                val appDirs = File("/data/app").listFiles()
+                if (appDirs != null) {
+                    for (dir in appDirs) {
+                        if (dir.name.contains("cz.galaxyai.lsposed")) {
+                            val base = File(dir, "base.apk")
+                            if (base.exists()) {
+                                apkFile = base
+                                break
+                            }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+
+        // Metoda 4: Přes PackageManager
+        if (apkFile == null) {
+            try {
+                val pm = app?.packageManager
+                val moduleInfo = pm?.getApplicationInfo("cz.galaxyai.lsposed", 0)
+                val sDir = moduleInfo?.sourceDir
+                if (sDir != null && File(sDir).exists()) {
+                    apkFile = File(sDir)
+                }
+            } catch (_: Throwable) {}
+        }
+
+        return apkFile
+    }
 
     fun ensureNativeLibraries() {
         if (isNativeLoaded) return
@@ -89,62 +169,9 @@ object SttEngineManager {
                 "libsherpa-onnx-jni.so"
             )
 
-            val app = try {
-                val atClass = Class.forName("android.app.ActivityThread")
-                atClass.getMethod("currentApplication").invoke(null) as? android.app.Application
-            } catch (_: Throwable) { null }
-
-            val cacheDir = app?.cacheDir ?: File("/data/user/0/com.samsung.android.intellivoiceservice/cache")
-            val targetLibDir = File(cacheDir, "galaxyai_native_libs").apply { mkdirs() }
-
-            // Zjištění cesty k base.apk našeho modulu (i při platnosti Android 11+ Package Visibility)
-            var apkFile: File? = null
-
-            // Metoda 1: Získání z MainHook.modulePath (přímo z Xposed initZygote)
-            if (cz.galaxyai.lsposed.MainHook.modulePath != null) {
-                val f = File(cz.galaxyai.lsposed.MainHook.modulePath!!)
-                if (f.exists()) apkFile = f
-            }
-
-            // Metoda 2: Získání z LspModuleClassLoader řetězce
-            if (apkFile == null) {
-                val clStr = SttEngineManager::class.java.classLoader?.toString() ?: ""
-                val moduleMatch = Regex("module=([^,\\]]+)").find(clStr)
-                if (moduleMatch != null) {
-                    val f = File(moduleMatch.groupValues[1].trim())
-                    if (f.exists()) apkFile = f
-                }
-            }
-
-            // Metoda 3: Prohledání /data/app
-            if (apkFile == null) {
-                try {
-                    val appDirs = File("/data/app").listFiles()
-                    if (appDirs != null) {
-                        for (dir in appDirs) {
-                            if (dir.name.contains("cz.galaxyai.lsposed")) {
-                                val base = File(dir, "base.apk")
-                                if (base.exists()) {
-                                    apkFile = base
-                                    break
-                                }
-                            }
-                        }
-                    }
-                } catch (_: Throwable) {}
-            }
-
-            // Metoda 4: Přes PackageManager
-            if (apkFile == null) {
-                try {
-                    val pm = app?.packageManager
-                    val moduleInfo = pm?.getApplicationInfo("cz.galaxyai.lsposed", 0)
-                    val sDir = moduleInfo?.sourceDir
-                    if (sDir != null && File(sDir).exists()) {
-                        apkFile = File(sDir)
-                    }
-                } catch (_: Throwable) {}
-            }
+            val app = currentApplication()
+            val targetLibDir = hostTargetLibDir(app)
+            val apkFile = findModuleApk(app)
 
             Log.i(TAG, "[SttEngine] Nalezen base.apk modulu: ${apkFile?.absolutePath}")
 
@@ -181,21 +208,21 @@ object SttEngineManager {
 
                 // 3. Extrakce přímo z base.apk do cacheDir
                 try {
-                    val zip = ZipFile(apkFile)
-                    for (libName in libs) {
-                        val entry = zip.getEntry("lib/arm64-v8a/$libName")
-                        if (entry != null) {
-                            val dstFile = File(targetLibDir, libName)
-                            if (!dstFile.exists() || dstFile.length() != entry.size) {
-                                zip.getInputStream(entry).use { input ->
-                                    dstFile.outputStream().use { output ->
-                                        input.copyTo(output)
+                    ZipFile(apkFile).use { zip ->
+                        for (libName in libs) {
+                            val entry = zip.getEntry("lib/arm64-v8a/$libName")
+                            if (entry != null) {
+                                val dstFile = File(targetLibDir, libName)
+                                if (!dstFile.exists() || dstFile.length() != entry.size) {
+                                    zip.getInputStream(entry).use { input ->
+                                        dstFile.outputStream().use { output ->
+                                            input.copyTo(output)
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    zip.close()
 
                     for (libName in libs) {
                         val f = File(targetLibDir, libName)
@@ -209,45 +236,138 @@ object SttEngineManager {
                     Log.e(TAG, "[SttEngine] Extrakce z base.apk do cacheDir selhala: ${t.message}", t)
                 }
             }
+        }
+    }
 
-            // 4. Zkopírování .so souborů z /storage/emulated/0 do spustitelného cacheDir hostitelské aplikace
-            // (Na /storage/emulated/0 platí noexec příznak jádra, v cacheDir je spouštění nativních knihoven povoleno)
-            val storageLibDirs = listOf(
-                File("/storage/emulated/0/GalaxyAI/models/lib/arm64-v8a"),
-                File("/sdcard/GalaxyAI/models/lib/arm64-v8a")
-            )
+    /**
+     * Zjistí podporované ARMv8 instrukce (/proc/cpuinfo – průnik přes všechna jádra)
+     * a vrátí kandidáty CzechSpeech JNI knihoven od nejrychlejší po základní.
+     */
+    private fun selectCzechSpeechLibCandidates(): List<String> {
+        var common: Set<String>? = null
+        try {
+            val cpuInfo = File("/proc/cpuinfo").readText()
+            for (line in cpuInfo.lineSequence()) {
+                val key = line.substringBefore(':').trim()
+                if (!key.equals("Features", ignoreCase = true)) continue
+                val flags = line.substringAfter(':').trim()
+                    .split(' ', '\t')
+                    .filter { it.isNotEmpty() }
+                    .toSet()
+                common = common?.intersect(flags) ?: flags
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "[SttEngine] Nelze přečíst /proc/cpuinfo, zkouším základní armv8a variantu: ${t.message}")
+        }
 
-            for (srcDir in storageLibDirs) {
-                if (srcDir.exists() && srcDir.isDirectory) {
-                    try {
-                        var allCopied = true
-                        for (libName in libs) {
-                            val srcFile = File(srcDir, libName)
-                            val dstFile = File(targetLibDir, libName)
-                            if (srcFile.exists()) {
-                                if (!dstFile.exists() || dstFile.length() != srcFile.length()) {
-                                    srcFile.copyTo(dstFile, overwrite = true)
-                                }
-                            } else {
-                                allCopied = false
-                            }
+        val flags = common.orEmpty()
+        val hasDotprod = "asimddp" in flags
+        val hasFp16 = "asimdhp" in flags && "fphp" in flags
+        val hasI8mm = "i8mm" in flags
+
+        val candidates = mutableListOf<String>()
+        if (hasDotprod && hasFp16 && hasI8mm) {
+            candidates.add("libczechspeech_armv82_dotprod_fp16_i8mm.so")
+        }
+        if (hasDotprod && hasFp16) {
+            candidates.add("libczechspeech_armv82_dotprod_fp16.so")
+        }
+        candidates.add("libczechspeech_armv8a.so")
+        return candidates
+    }
+
+    /**
+     * Extrahuje a načte nativní knihovnu CzechSpeech (`libczechspeech_*.so`) z APK do
+     * spustitelného `cacheDir` hostitelského procesu, aby nedocházelo k `dlopen: noexec` ani
+     * k selhání `System.loadLibrary()` uvnitř LSPosed hooku.
+     */
+    fun ensureCzechSpeechNativeLibrary(): Boolean {
+        if (isCzechSpeechNativeLoaded) return true
+        synchronized(this) {
+            if (isCzechSpeechNativeLoaded) return true
+
+            try {
+                android.system.Os.setenv("GGML_NO_BACKTRACE", "1", false)
+            } catch (_: Throwable) {}
+
+            val app = currentApplication()
+            val targetLibDir = hostTargetLibDir(app)
+            val apkFile = findModuleApk(app)
+            val candidates = selectCzechSpeechLibCandidates()
+            Log.i(TAG, "[SttEngine] CzechSpeech nativní kandidáti: ${candidates.joinToString()} (apk=${apkFile?.absolutePath})")
+
+            if (apkFile != null) {
+                val libDir = File(apkFile.parentFile, "lib/arm64")
+                for (soName in candidates) {
+                    val unpacked = File(libDir, soName)
+                    if (unpacked.exists()) {
+                        try {
+                            System.load(unpacked.absolutePath)
+                            isCzechSpeechNativeLoaded = true
+                            Log.i(TAG, "[SttEngine] CzechSpeech knihovna načtena z lib/arm64: $soName (${CzechSpeechBridge.systemInfo()})")
+                            return true
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "[SttEngine] Načtení $soName z lib/arm64 selhalo: ${t.message}")
                         }
-
-                        if (allCopied) {
-                            for (libName in libs) {
-                                val f = File(targetLibDir, libName)
-                                System.load(f.absolutePath)
-                                Log.i(TAG, "[SttEngine] Úspěšně načtena knihovna zkopírovaná do cacheDir: ${f.absolutePath}")
-                            }
-                            isNativeLoaded = true
-                            Log.i(TAG, "[SttEngine] Všechny nativní knihovny úspěšně načteny přes cacheDir!")
-                            return
-                        }
-                    } catch (e: Throwable) {
-                        Log.e(TAG, "[SttEngine] Chyba při kopírování/načítání knihoven ze storage: ${e.message}", e)
                     }
                 }
+
+                try {
+                    ZipFile(apkFile).use { zip ->
+                        for (soName in candidates) {
+                            val entry = zip.getEntry("lib/arm64-v8a/$soName") ?: continue
+                            val dstFile = File(targetLibDir, soName)
+                            if (!dstFile.exists() || dstFile.length() != entry.size) {
+                                zip.getInputStream(entry).use { input ->
+                                    dstFile.outputStream().use { output ->
+                                        input.copyTo(output)
+                                    }
+                                }
+                            }
+                            try {
+                                dstFile.setReadable(true, true)
+                                dstFile.setExecutable(true, true)
+                            } catch (_: Throwable) {}
+                            try {
+                                System.load(dstFile.absolutePath)
+                                isCzechSpeechNativeLoaded = true
+                                Log.i(TAG, "[SttEngine] CzechSpeech knihovna načtena z cacheDir: $soName (${CzechSpeechBridge.systemInfo()})")
+                                return true
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "[SttEngine] Načtení $soName z cacheDir selhalo: ${t.message}")
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "[SttEngine] Extrakce CzechSpeech .so z base.apk selhala: ${t.message}", t)
+                }
             }
+
+            return false
+        }
+    }
+
+    private fun releaseCzechSpeechLocked() {
+        val h = czechSpeechHandle
+        if (h != 0L) {
+            try {
+                CzechSpeechBridge.whisperFree(h)
+            } catch (_: Throwable) {}
+            czechSpeechHandle = 0L
+            czechSpeechModelPath = null
+            Log.i(TAG, "[SttEngine] Uvolněna instance CzechSpeech z RAM.")
+        }
+    }
+
+    private fun releaseSherpaLocked() {
+        if (recognizer != null) {
+            try {
+                recognizer?.release()
+            } catch (_: Throwable) {}
+            recognizer = null
+            activeModelId = null
+            activeLanguageCode = null
+            Log.i(TAG, "[SttEngine] Uvolněna instance Sherpa OfflineRecognizer z RAM.")
         }
     }
 
@@ -288,11 +408,35 @@ object SttEngineManager {
             val localDir = File(context.filesDir, "models/whisper-$modelId").apply { mkdirs() }
             val localFile = File(localDir, fileName)
 
-            // Pokud lokální soubor již existuje a je kompletní, použijeme jej přímo
+            // Pokud lokální soubor existuje, ověříme, že model nebyl mezitím smazán uživatelem
             if (localFile.exists() && localFile.length() > 0) {
                 val cLen = try { candidate?.length() ?: 0L } catch (_: Throwable) { 0L }
-                if (cLen == 0L || localFile.length() == cLen) {
-                    return localFile
+                if (cLen > 0L) {
+                    if (localFile.length() == cLen) return localFile
+                } else if (!mediaDirFile.exists()) {
+                    val uri = Uri.parse("content://cz.galaxyai.lsposed.modelprovider/whisper-$modelId/$fileName")
+                    val providerStatus: Long? = try {
+                        context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+                    } catch (_: java.io.FileNotFoundException) {
+                        -2L
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    when {
+                        providerStatus == -2L -> {
+                            Log.i(TAG, "[SttEngine] Model $modelId byl smazán – odstraňuji zastaralou kopii ${localFile.name}")
+                            localFile.delete()
+                            return null
+                        }
+                        providerStatus != null && providerStatus > 0L && localFile.length() == providerStatus -> {
+                            return localFile
+                        }
+                        providerStatus == null -> {
+                            if (ModuleConfig.isModelInstalled(modelId)) return localFile
+                            localFile.delete()
+                            return null
+                        }
+                    }
                 }
             }
 
@@ -348,38 +492,51 @@ object SttEngineManager {
 
     private fun getOrInitRecognizer(targetWhisperLang: String): OfflineRecognizer? {
         val config = ModuleConfig.load()
-        val preferredModel = config.selectedModel
+        val preferredInfo = ModuleConfig.getModelById(config.selectedModel)
+        var resolvedModelId = if (preferredInfo?.engine == ModelEngine.SHERPA_ONNX) {
+            preferredInfo.id
+        } else {
+            "turbo"
+        }
+        if (ModuleConfig.getModelDirectory(resolvedModelId) == null) {
+            for (fallback in listOf("turbo", "small", "base", "tiny")) {
+                if (ModuleConfig.getModelDirectory(fallback) != null) {
+                    resolvedModelId = fallback
+                    break
+                }
+            }
+        }
 
-        if (recognizer != null && activeModelId == preferredModel && activeLanguageCode == targetWhisperLang) {
+        if (recognizer != null && activeModelId == resolvedModelId && activeLanguageCode == targetWhisperLang) {
             return recognizer
         }
 
-        synchronized(this) {
-            if (recognizer != null && activeModelId == preferredModel && activeLanguageCode == targetWhisperLang) {
+        synchronized(engineLock) {
+            val freshConfig = ModuleConfig.load()
+            val freshPrefInfo = ModuleConfig.getModelById(freshConfig.selectedModel)
+            var modelId = if (freshPrefInfo?.engine == ModelEngine.SHERPA_ONNX) {
+                freshPrefInfo.id
+            } else {
+                "turbo"
+            }
+            if (ModuleConfig.getModelDirectory(modelId) == null) {
+                for (fallback in listOf("turbo", "small", "base", "tiny")) {
+                    if (ModuleConfig.getModelDirectory(fallback) != null) {
+                        modelId = fallback
+                        break
+                    }
+                }
+            }
+
+            if (recognizer != null && activeModelId == modelId && activeLanguageCode == targetWhisperLang) {
                 return recognizer
             }
 
             try {
+                releaseCzechSpeechLocked()
                 ensureNativeLibraries()
 
-                var modelId = preferredModel
-                var modelDir = ModuleConfig.getModelDirectory(modelId)
-
-                if (modelDir == null) {
-                    for (fallback in listOf("turbo", "small", "base", "tiny")) {
-                        val d = ModuleConfig.getModelDirectory(fallback)
-                        if (d != null) {
-                            modelId = fallback
-                            modelDir = d
-                            break
-                        }
-                    }
-                }
-
-                val app = try {
-                    val atClass = Class.forName("android.app.ActivityThread")
-                    atClass.getMethod("currentApplication").invoke(null) as? android.app.Application
-                } catch (_: Throwable) { null }
+                val app = currentApplication()
 
                 val encoderFile = getOrResolveModelFile(app, modelId, "$modelId-encoder.int8.onnx")
                 val decoderFile = getOrResolveModelFile(app, modelId, "$modelId-decoder.int8.onnx")
@@ -421,9 +578,7 @@ object SttEngineManager {
                 }
 
                 Log.i(TAG, "[SttEngine] Inicializuji Whisper '$modelId' pro jazyk '$targetWhisperLang'...")
-                try {
-                    recognizer?.release()
-                } catch (_: Throwable) {}
+                releaseSherpaLocked()
 
                 val instance = OfflineRecognizer(null, recognizerConfig)
                 recognizer = instance
@@ -435,6 +590,117 @@ object SttEngineManager {
             } catch (t: Throwable) {
                 Log.e(TAG, "[SttEngine] Selhala inicializace OfflineRecognizer: ${t.message}", t)
                 return null
+            }
+        }
+    }
+
+    private fun getOrInitCzechSpeech(): Long {
+        val modelInfo = ModuleConfig.getModelById("czechspeech") ?: return 0L
+        val app = currentApplication()
+        val resolvedFile = getOrResolveModelFile(app, modelInfo.id, modelInfo.ggmlFileName)
+        if (resolvedFile == null || !resolvedFile.exists() || resolvedFile.length() <= 100_000_000L) {
+            Log.w(TAG, "[SttEngine] Model CzechSpeech (${modelInfo.ggmlFileName}) nebyl nalezen nebo je nekompletní.")
+            return 0L
+        }
+
+        if (czechSpeechHandle != 0L && czechSpeechModelPath == resolvedFile.absolutePath) {
+            return czechSpeechHandle
+        }
+
+        synchronized(engineLock) {
+            if (czechSpeechHandle != 0L && czechSpeechModelPath == resolvedFile.absolutePath) {
+                return czechSpeechHandle
+            }
+
+            if (!ensureCzechSpeechNativeLibrary()) {
+                Log.e(TAG, "[SttEngine] Nelze načíst nativní knihovnu CzechSpeech.")
+                return 0L
+            }
+
+            try {
+                releaseSherpaLocked()
+                releaseCzechSpeechLocked()
+
+                Log.i(TAG, "[SttEngine] Inicializuji CzechSpeech (ggml whisper.cpp) z ${resolvedFile.absolutePath}...")
+                val handle = CzechSpeechBridge.whisperInit(resolvedFile.absolutePath)
+                if (handle == 0L) {
+                    Log.e(TAG, "[SttEngine] CzechSpeechBridge.whisperInit vrátil 0 pro ${resolvedFile.absolutePath}")
+                    return 0L
+                }
+                CzechSpeechBridge.setMinAudioCtx(handle, 512)
+                czechSpeechHandle = handle
+                czechSpeechModelPath = resolvedFile.absolutePath
+                Log.i(TAG, "[SttEngine] CzechSpeech úspěšně inicializován (min_audio_ctx=512, vláken=${czechSpeechThreads()})!")
+                return handle
+            } catch (t: Throwable) {
+                Log.e(TAG, "[SttEngine] Selhala inicializace CzechSpeech: ${t.message}", t)
+                return 0L
+            }
+        }
+    }
+
+    private fun czechSpeechThreads(): Int {
+        return try {
+            CzechSpeechBridge.defaultThreadCount().coerceIn(2, 8)
+        } catch (_: Throwable) {
+            decoderThreads()
+        }
+    }
+
+    private fun decodeWithCzechSpeech(handle: Long, chunkSamples: FloatArray, whisperLang: String): String {
+        if (chunkSamples.isEmpty()) return ""
+        // generation NESMÍ být 0 (nativeWhisperInit nastavuje abort_generation = 0 a cs_abort_callback porovnává shodu)
+        var gen = czechSpeechGen.incrementAndGet()
+        if (gen == 0) gen = czechSpeechGen.incrementAndGet()
+
+        val bytes = CzechSpeechBridge.whisperTranscribe(
+            handle,
+            gen,
+            chunkSamples,
+            chunkSamples.size,
+            czechSpeechThreads(),
+            whisperLang
+        ) ?: return ""
+        if (bytes.isEmpty()) return ""
+
+        val raw = String(bytes, Charsets.UTF_8).trim()
+        if (raw.none { it.isLetterOrDigit() }) return ""
+
+        val cleaned = try {
+            CzechSpeechBridge.cleanRepetitions(raw).trim()
+        } catch (_: Throwable) {
+            raw
+        }
+        return if (cleaned.none { it.isLetterOrDigit() }) "" else cleaned
+    }
+
+    private fun shouldUseCzechSpeech(whisperLang: String): Boolean {
+        val config = ModuleConfig.load()
+        val preferred = ModuleConfig.getModelById(config.selectedModel)
+        val csInstalled = ModuleConfig.isModelInstalled("czechspeech")
+        val anyOnnxInstalled = ModuleConfig.MODELS.any {
+            it.engine == ModelEngine.SHERPA_ONNX && ModuleConfig.isModelInstalled(it.id)
+        }
+
+        return if (preferred?.engine == ModelEngine.CZECH_SPEECH_GGML) {
+            when {
+                whisperLang == "cs" -> csInstalled
+                anyOnnxInstalled -> {
+                    Log.i(TAG, "[SttEngine] Model CzechSpeech je pouze pro češtinu – pro '$whisperLang' přepínám na nainstalovaný Whisper ONNX model.")
+                    false
+                }
+                csInstalled -> {
+                    Log.w(TAG, "[SttEngine] Model CzechSpeech je optimalizován výhradně pro češtinu a žádný Whisper ONNX fallback není nainstalován.")
+                    true
+                }
+                else -> false
+            }
+        } else {
+            if (!anyOnnxInstalled && whisperLang == "cs" && csInstalled) {
+                Log.i(TAG, "[SttEngine] Žádný ONNX model není nainstalován – pro češtinu přepínám na nainstalovaný CzechSpeech.")
+                true
+            } else {
+                false
             }
         }
     }
@@ -559,7 +825,7 @@ object SttEngineManager {
      * s jednotným mluvčím (speakerId = 0 -> Mluvčí 1).
      * Zabraňuje fragmentaci na sub-sekundové úseky a halucinacím Whisperu.
      */
-    private fun buildMonologueWindows(
+    internal fun buildMonologueWindows(
         totalDurationMs: Int,
         floatSamples: FloatArray,
         sampleRate: Int = 16000,
@@ -609,7 +875,7 @@ object SttEngineManager {
         return windows.filter { it.endMs > it.startMs }
     }
 
-    private fun buildDecodeWindows(
+    internal fun buildDecodeWindows(
         diarized: List<SegmentInfo>,
         floatSamples: FloatArray,
         sampleRate: Int = 16000,
@@ -766,7 +1032,7 @@ object SttEngineManager {
     }
 
     /** Rozdělí slova na věty (bubliny) podle koncové interpunkce a delších mezer. */
-    private fun splitIntoSentences(words: List<TimedWord>, gapMs: Int = 700): List<List<TimedWord>> {
+    internal fun splitIntoSentences(words: List<TimedWord>, gapMs: Int = 700): List<List<TimedWord>> {
         if (words.isEmpty()) return emptyList()
         val sentences = mutableListOf<List<TimedWord>>()
         var current = mutableListOf<TimedWord>()
@@ -952,6 +1218,7 @@ object SttEngineManager {
             Log.i(TAG, "[SttEngine] Nahrávka má ${durationMs} ms (> 30 s). Používám bleskovou VAD diarizaci pro okamžitou odezvu.")
             return null
         }
+        ensureNativeLibraries()
         val budgetMs = 5000L
         val executor = Executors.newSingleThreadExecutor { r ->
             Thread(r, "galaxyai-speaker-diarizer").apply { isDaemon = true }
@@ -1021,7 +1288,7 @@ object SttEngineManager {
      * sousední segmenty téhož mluvčího a očíslujeme je 0..N-1 podle prvního
      * výskytu (Diktafon zobrazuje `speakerId + 1`).
      */
-    private fun limitSpeakers(segments: List<SegmentInfo>, maxSpeakers: Int = MAX_SPEAKERS): List<SegmentInfo> {
+    internal fun limitSpeakers(segments: List<SegmentInfo>, maxSpeakers: Int = MAX_SPEAKERS): List<SegmentInfo> {
         if (segments.isEmpty()) return segments
 
         val durations = HashMap<Int, Int>()
@@ -1055,7 +1322,7 @@ object SttEngineManager {
     }
 
     /** Slije sousední segmenty stejného mluvčího a přečísluje mluvčí 0..N-1. */
-    private fun renumberAndMerge(segments: List<SegmentInfo>): List<SegmentInfo> {
+    internal fun renumberAndMerge(segments: List<SegmentInfo>): List<SegmentInfo> {
         val idMap = HashMap<Int, Int>()
         val merged = ArrayList<SegmentInfo>(segments.size)
         for (s in segments) {
@@ -1093,7 +1360,7 @@ object SttEngineManager {
      *  - ořízne na délku nahrávky a rozdělí okna delší než 30 s (Whisper swift sám
      *    doplňuje jen 30s kontext, delší okno by se tiše zkrátilo).
      */
-    private fun normalizeExternalSegments(
+    internal fun normalizeExternalSegments(
         segments: List<SegmentInfo>,
         totalDurationMs: Int,
         maxWindowMs: Int = 30000
@@ -1164,110 +1431,164 @@ object SttEngineManager {
             }
         }
 
-        val rec = getOrInitRecognizer(whisperLang)
-        if (rec == null) {
-            Log.w(TAG, "[SttEngine] OfflineRecognizer nebyl nalezen. Používám záložní výsledek.")
-            return buildFallbackResult(totalDurationMs, langInfo?.displayName ?: "zvoleného jazyka", isModelMissing = true)
-        }
-
-        // Hlasová schránka je z definice monolog jednoho volajícího (Mluvčí 1).
-        // Krátké nahrávky do 25 sekund, které nejsou telefonním hovorem, jsou rovněž typicky monolog (hlasová poznámka/diktát).
-        val isSingleSpeaker = isVoicemail || (!isCall && totalDurationMs <= 25000L)
-
-        // Získání segmentů řeči:
-        // Buď jednomluvčí okno (hlasová schránka/poznámka), externí diarizér, nebo interní VAD + akustická diarizace
-        val targetSegments: List<SegmentInfo> = if (isSingleSpeaker) {
-            Log.i(TAG, "[SttEngine] Jednomluvčí režim (isVoicemail=$isVoicemail, isCall=$isCall, délka=${totalDurationMs} ms) -> celistvé okno s 1 mluvčím.")
-            buildMonologueWindows(totalDurationMs, floatSamples, 16000, maxWindowMs = 28000)
-        } else if (!externalSegments.isNullOrEmpty()) {
-            val normalized = normalizeExternalSegments(externalSegments, totalDurationMs)
-            if (normalized.isEmpty()) {
-                Log.w(TAG, "[SttEngine] Externí diarizér nevrátil použitelné segmenty, počítám vlastní VAD.")
-                internalSegments(floatSamples)
-            } else {
-                Log.i(TAG, "[SttEngine] Používám ${normalized.size} segmentů z externího (Samsung) diarizéru.")
-                normalized
-            }
-        } else {
-            internalSegments(floatSamples)
-        }
-
+        val debugLogging = ModuleConfig.load().debugLogging
         val recognizedSentences = mutableListOf<String>()
         val resultSegments = mutableListOf<SegmentInfo>()
         val allWords = mutableListOf<WordSegment>()
 
-        for ((idx, seg) in targetSegments.withIndex()) {
-            val startSample = ((seg.startMs * 16000L) / 1000L).toInt().coerceIn(0, sampleCount)
-            val endSample = ((seg.endMs * 16000L) / 1000L).toInt().coerceIn(startSample, sampleCount)
-            val chunkLen = endSample - startSample
-            if (chunkLen < 1600) continue // Ignorovat segmenty kratší než 100 ms
-
-            val chunkSamples = FloatArray(chunkLen)
-            System.arraycopy(floatSamples, startSample, chunkSamples, 0, chunkLen)
-
-            try {
-                val stream = rec.createStream()
-                stream.acceptWaveform(chunkSamples, 16000)
-                rec.decode(stream)
-                val res = rec.getResult(stream)
-                stream.release()
-
-                val segText = res.text.trim()
-                if (segText.isEmpty()) continue
-
-                Log.i(TAG, "[SttEngine] Okno $idx [Mluvčí ${seg.speakerId}] [${seg.startMs}..${seg.endMs} ms]: \"$segText\"")
-
-                // Slova a jejich časování z token timestampů Whisperu (přesnější než rovnoměrné dělení)
-                val timedWords = extractTimedWords(res, seg.startMs, seg.endMs)
-
-                // Rozdělení okna na věty (bubliny) podle interpunkce a delších mezer
-                val sentences = splitIntoSentences(timedWords)
-                if (sentences.isEmpty()) {
-                    recognizedSentences.add(segText)
-                    resultSegments.add(seg)
-                    continue
-                }
-
-                for (sentence in sentences) {
-                    recognizedSentences.add(sentence.joinToString(" ") { it.text })
-                    resultSegments.add(
-                        SegmentInfo(
-                            startMs = sentence.first().startMs,
-                            endMs = sentence.last().endMs,
-                            speakerId = seg.speakerId
-                        )
-                    )
-                    for (w in sentence) allWords.add(WordSegment(w.text, w.startMs, w.endMs))
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "[SttEngine] Chyba při dekódování okna $idx: ${t.message}", t)
+        synchronized(engineLock) {
+            val useCzechSpeech = shouldUseCzechSpeech(whisperLang)
+            val csHandle = if (useCzechSpeech) getOrInitCzechSpeech() else 0L
+            val rec: OfflineRecognizer? = if (csHandle == 0L) getOrInitRecognizer(whisperLang) else null
+            if (csHandle == 0L && rec == null) {
+                Log.w(TAG, "[SttEngine] Žádný použitelný STT engine (CzechSpeech ani OfflineRecognizer) nebyl nalezen. Používám záložní výsledek.")
+                return buildFallbackResult(totalDurationMs, langInfo?.displayName ?: "zvoleného jazyka", isModelMissing = true)
             }
-        }
 
-        // Pokud žádný segment nevrátil text, zkusíme celé audio najednou
-        if (recognizedSentences.isEmpty()) {
-            try {
-                Log.w(TAG, "[SttEngine] Segmenty vrátily prázdný text, zkouším celé audio najednou...")
-                val stream = rec.createStream()
-                stream.acceptWaveform(floatSamples, 16000)
-                rec.decode(stream)
-                val res = rec.getResult(stream)
-                stream.release()
+            // Hlasová schránka je z definice monolog jednoho volajícího (Mluvčí 1).
+            // Krátké nahrávky do 25 sekund, které nejsou telefonním hovorem, jsou rovněž typicky monolog (hlasová poznámka/diktát).
+            val isSingleSpeaker = isVoicemail || (!isCall && totalDurationMs <= 25000L)
 
-                val text = res.text.trim()
-                if (text.isNotEmpty()) {
-                    recognizedSentences.add(text)
-                    resultSegments.add(SegmentInfo(0, totalDurationMs, 0))
-                    val words = text.split(Regex("\\s+")).filter { it.isNotBlank() }
-                    val wordDur = if (words.isNotEmpty()) totalDurationMs / words.size else 100
-                    for (i in words.indices) {
-                        val s = i * wordDur
-                        val e = if (i == words.size - 1) totalDurationMs else (i + 1) * wordDur
-                        allWords.add(WordSegment(words[i], s, e))
-                    }
+            // Získání segmentů řeči:
+            // Buď jednomluvčí okno (hlasová schránka/poznámka), externí diarizér, nebo interní VAD + akustická diarizace
+            val targetSegments: List<SegmentInfo> = if (isSingleSpeaker) {
+                Log.i(TAG, "[SttEngine] Jednomluvčí režim (isVoicemail=$isVoicemail, isCall=$isCall, délka=${totalDurationMs} ms) -> celistvé okno s 1 mluvčím.")
+                buildMonologueWindows(totalDurationMs, floatSamples, 16000, maxWindowMs = 28000)
+            } else if (!externalSegments.isNullOrEmpty()) {
+                val normalized = normalizeExternalSegments(externalSegments, totalDurationMs)
+                if (normalized.isEmpty()) {
+                    Log.w(TAG, "[SttEngine] Externí diarizér nevrátil použitelné segmenty, počítám vlastní VAD.")
+                    internalSegments(floatSamples)
+                } else {
+                    Log.i(TAG, "[SttEngine] Používám ${normalized.size} segmentů z externího (Samsung) diarizéru.")
+                    normalized
                 }
-            } catch (t: Throwable) {
-                Log.e(TAG, "[SttEngine] Chyba při celkovém dekódování: ${t.message}", t)
+            } else {
+                internalSegments(floatSamples)
+            }
+
+            for ((idx, seg) in targetSegments.withIndex()) {
+                val startSample = ((seg.startMs * 16000L) / 1000L).toInt().coerceIn(0, sampleCount)
+                val endSample = ((seg.endMs * 16000L) / 1000L).toInt().coerceIn(startSample, sampleCount)
+                val chunkLen = endSample - startSample
+                if (chunkLen < 1600) continue // Ignorovat segmenty kratší než 100 ms
+
+                val chunkSamples = FloatArray(chunkLen)
+                System.arraycopy(floatSamples, startSample, chunkSamples, 0, chunkLen)
+
+                try {
+                    val timedWords: List<TimedWord>
+                    val segText: String
+                    if (csHandle != 0L) {
+                        segText = decodeWithCzechSpeech(csHandle, chunkSamples, whisperLang)
+                        if (segText.isEmpty()) continue
+                        timedWords = distributeWords(segText, seg.startMs, seg.endMs)
+                    } else {
+                        val activeRec = rec ?: continue
+                        val stream = activeRec.createStream()
+                        val res = try {
+                            stream.acceptWaveform(chunkSamples, 16000)
+                            activeRec.decode(stream)
+                            activeRec.getResult(stream)
+                        } finally {
+                            stream.release()
+                        }
+
+                        segText = res.text.trim()
+                        if (segText.isEmpty()) continue
+
+                        // Slova a jejich časování z token timestampů Whisperu (přesnější než rovnoměrné dělení)
+                        timedWords = extractTimedWords(res, seg.startMs, seg.endMs)
+                    }
+
+                    if (debugLogging) {
+                        Log.i(TAG, "[SttEngine] Okno $idx [Mluvčí ${seg.speakerId}] [${seg.startMs}..${seg.endMs} ms]: \"$segText\"")
+                    } else {
+                        Log.i(TAG, "[SttEngine] Okno $idx [Mluvčí ${seg.speakerId}] [${seg.startMs}..${seg.endMs} ms]: (${segText.length} znaků)")
+                    }
+
+                    // Rozdělení okna na věty (bubliny) podle interpunkce a delších mezer
+                    val sentences = splitIntoSentences(timedWords)
+                    if (sentences.isEmpty()) {
+                        recognizedSentences.add(segText)
+                        resultSegments.add(seg)
+                        continue
+                    }
+
+                    for (sentence in sentences) {
+                        recognizedSentences.add(sentence.joinToString(" ") { it.text })
+                        resultSegments.add(
+                            SegmentInfo(
+                                startMs = sentence.first().startMs,
+                                endMs = sentence.last().endMs,
+                                speakerId = seg.speakerId
+                            )
+                        )
+                        for (w in sentence) allWords.add(WordSegment(w.text, w.startMs, w.endMs))
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "[SttEngine] Chyba při dekódování okna $idx: ${t.message}", t)
+                }
+            }
+
+            // Pokud žádný segment nevrátil text, zkusíme audio po maximálně 28s blocích najednou
+            if (recognizedSentences.isEmpty()) {
+                try {
+                    Log.w(TAG, "[SttEngine] Segmenty vrátily prázdný text, zkouším záložní průchod...")
+                    val maxChunkSamples = 28 * 16000
+                    val text: String = if (csHandle != 0L) {
+                        if (floatSamples.size <= maxChunkSamples) {
+                            decodeWithCzechSpeech(csHandle, floatSamples, whisperLang)
+                        } else {
+                            val parts = mutableListOf<String>()
+                            var pos = 0
+                            while (pos < floatSamples.size) {
+                                val len = Math.min(maxChunkSamples, floatSamples.size - pos)
+                                if (len >= 1600) {
+                                    val slice = floatSamples.copyOfRange(pos, pos + len)
+                                    val partText = decodeWithCzechSpeech(csHandle, slice, whisperLang)
+                                    if (partText.isNotBlank()) parts.add(partText)
+                                }
+                                pos += len
+                            }
+                            parts.joinToString(" ")
+                        }
+                    } else {
+                        val activeRec = rec!!
+                        val parts = mutableListOf<String>()
+                        var pos = 0
+                        while (pos < floatSamples.size) {
+                            val len = Math.min(maxChunkSamples, floatSamples.size - pos)
+                            if (len >= 1600) {
+                                val slice = floatSamples.copyOfRange(pos, pos + len)
+                                val stream = activeRec.createStream()
+                                val partText = try {
+                                    stream.acceptWaveform(slice, 16000)
+                                    activeRec.decode(stream)
+                                    activeRec.getResult(stream).text.trim()
+                                } finally {
+                                    stream.release()
+                                }
+                                if (partText.isNotBlank()) parts.add(partText)
+                            }
+                            pos += len
+                        }
+                        parts.joinToString(" ")
+                    }
+                    if (text.isNotEmpty()) {
+                        recognizedSentences.add(text)
+                        resultSegments.add(SegmentInfo(0, totalDurationMs, 0))
+                        val words = text.split(Regex("\\s+")).filter { it.isNotBlank() }
+                        val wordDur = if (words.isNotEmpty()) totalDurationMs / words.size else 100
+                        for (i in words.indices) {
+                            val s = i * wordDur
+                            val e = if (i == words.size - 1) totalDurationMs else (i + 1) * wordDur
+                            allWords.add(WordSegment(words[i], s, e))
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "[SttEngine] Chyba při celkovém dekódování: ${t.message}", t)
+                }
             }
         }
 
@@ -1284,7 +1605,11 @@ object SttEngineManager {
             timingInfo[i * 2 + 1] = allWords[i].endMs / 10
         }
 
-        Log.i(TAG, "[SttEngine] Přepis kompletní: ${recognizedSentences.size} vět, ${allWords.size} slov, ${resultSegments.map { it.speakerId }.distinct().size} mluvčích: \"$fullText\"")
+        if (debugLogging) {
+            Log.i(TAG, "[SttEngine] Přepis kompletní: ${recognizedSentences.size} vět, ${allWords.size} slov, ${resultSegments.map { it.speakerId }.distinct().size} mluvčích: \"$fullText\"")
+        } else {
+            Log.i(TAG, "[SttEngine] Přepis kompletní: ${recognizedSentences.size} vět, ${allWords.size} slov, ${resultSegments.map { it.speakerId }.distinct().size} mluvčích")
+        }
 
         return SttResult(
             text = fullText,

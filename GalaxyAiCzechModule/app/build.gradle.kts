@@ -15,8 +15,8 @@ android {
         applicationId = "cz.galaxyai.lsposed"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         ndk {
             abiFilters.addAll(listOf("arm64-v8a"))
@@ -43,6 +43,7 @@ android {
 
     buildTypes {
         release {
+            // Minification stays disabled so reflection-based LSPosed hooks and JNI classes are never stripped.
             isMinifyEnabled = false
             if (keystorePropsFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")
@@ -67,14 +68,23 @@ android {
             useLegacyPackaging = true
         }
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
+    // Unit testing
+    testImplementation("junit:junit:4.13.2")
     // Xposed API
     compileOnly("de.robv.android.xposed:api:82")
 
     // Sherpa-ONNX local library
     implementation(files("libs/sherpa-onnx.jar"))
+
+    // Moravian AI CzechSpeech (whisper.cpp + ggml prebuilt arm64-v8a JNI for moravianai/CzechSpeech)
+    implementation("ai.moravian:czechspeech-android:0.3.0")
 
     // AndroidX & UI
     implementation("androidx.core:core-ktx:1.13.1")

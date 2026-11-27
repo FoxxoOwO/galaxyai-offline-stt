@@ -1,3 +1,5 @@
 -keep class cz.galaxyai.lsposed.MainHook { *; }
 -keepclassmembers class cz.galaxyai.lsposed.MainHook { *; }
 -keep class com.k2fsa.sherpa.onnx.** { *; }
+-keep class cz.galaxyai.lsposed.stt.CzechSpeechBridge { *; }
+-keep class ai.moravian.czechspeech.** { *; }

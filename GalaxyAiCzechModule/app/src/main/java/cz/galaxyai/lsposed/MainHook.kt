@@ -2,6 +2,7 @@ package cz.galaxyai.lsposed
 
 import android.util.Log
 import cz.galaxyai.lsposed.hooks.IntelliVoiceHook
+import cz.galaxyai.lsposed.hooks.SamsungNotesHook
 import cz.galaxyai.lsposed.hooks.VoiceNoteHook
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
@@ -13,6 +14,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         const val TAG = "GalaxyAiCzechHook"
         const val PKG_INTELLIVOICE = "com.samsung.android.intellivoiceservice"
         const val PKG_VOICENOTE = "com.sec.android.app.voicenote"
+        const val PKG_NOTES = "com.samsung.android.app.notes"
 
         @Volatile
         var modulePath: String? = null
@@ -32,6 +34,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             PKG_VOICENOTE -> {
                 Log.i(TAG, "Navazuji hook na $PKG_VOICENOTE (proces: ${lpparam.processName})")
                 VoiceNoteHook.init(lpparam)
+            }
+            PKG_NOTES -> {
+                Log.i(TAG, "Navazuji hook na $PKG_NOTES (proces: ${lpparam.processName})")
+                SamsungNotesHook.init(lpparam)
             }
         }
     }

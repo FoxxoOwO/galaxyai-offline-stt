@@ -14,14 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.InputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.Locale
-import java.util.concurrent.Callable
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 
 object IntelliVoiceHook {
 
@@ -30,18 +23,14 @@ object IntelliVoiceHook {
     private const val CLS_RECOGNITION_LISTENER =
         "com.samsung.android.sivs.ai.sdkcommon.asr.IRecognitionListener"
 
+    /** Bezpečnostní limit (90 min při 16 kHz / 16-bit mono), aby extrémně dlouhý proud nevyčerpal RAM. */
+    private const val MAX_PCM_BYTES = 16000 * 2 * 5400
+
     private val sttScope = CoroutineScope(Dispatchers.IO)
     private var serviceClassLoader: ClassLoader? = null
 
-    /**
-     * Jazyky, které Samsung přepisuje sám. Do těchto cest modul nikdy nezasahuje
-     * (rozhodnutí 2026-11-06), ale zároveň jim musí vypnout Samsungí diarizaci,
-     * protože její nativní knihovna na tomto zařízení chybí (viz `prepare()`).
-     */
-    private val OFFICIAL_SAMSUNG_LANGS = listOf(
-        "en", "de", "fr", "es", "it", "pt", "pl", "ru", "tr",
-        "ro", "sv", "nl", "zh", "ja", "ko", "th", "vi", "hi", "id", "ar"
-    )
+    @Suppress("DEPRECATION")
+    private fun getBundleAny(bundle: Bundle, key: String): Any? = bundle.get(key)
 
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
         // IntelliVoice Hook se týká výhradně ASR (rozpoznávání řeči).
@@ -86,7 +75,10 @@ object IntelliVoiceHook {
                     de.robv.android.xposed.XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             for (arg in param.args) {
-                                if (arg == "sherpa-onnx-jni") {
+                                val s = arg as? String ?: continue
+                                if (s == "sherpa-onnx-jni" ||
+                                    (s.startsWith("czechspeech_") && SttEngineManager.isCzechSpeechNativeLoaded)
+                                ) {
                                     param.result = null
                                     return
                                 }
@@ -99,14 +91,17 @@ object IntelliVoiceHook {
                 if (method.name == "loadLibrary") {
                     de.robv.android.xposed.XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (param.args.getOrNull(0) == "sherpa-onnx-jni") {
+                            val s = param.args.getOrNull(0) as? String ?: return
+                            if (s == "sherpa-onnx-jni" ||
+                                (s.startsWith("czechspeech_") && SttEngineManager.isCzechSpeechNativeLoaded)
+                            ) {
                                 param.result = null
                             }
                         }
                     })
                 }
             }
-            Log.i(TAG, "[IntelliVoice] Hook na Runtime/System loadLibrary úspěšně nastaven pro sherpa-onnx-jni.")
+            Log.i(TAG, "[IntelliVoice] Hook na Runtime/System loadLibrary úspěšně nastaven pro sherpa-onnx-jni a czechspeech.")
         } catch (t: Throwable) {
             Log.w(TAG, "[IntelliVoice] Hook na Runtime/System loadLibrary selhal: ${t.message}")
         }
@@ -128,15 +123,14 @@ object IntelliVoiceHook {
                         val config = ModuleConfig.load()
                         var detectedLocale: String? = null
 
-                        for (key in bundle.keySet()) {
-                            Log.i(TAG, "[IntelliVoice] prepare bundle[$key] = ${bundle.get(key)}")
+                        if (config.debugLogging) {
+                            for (key in bundle.keySet()) {
+                                Log.i(TAG, "[IntelliVoice] prepare bundle[$key] = ${getBundleAny(bundle, key)}")
+                            }
                         }
 
-                        // Samsungí diarizér řešíme až po detekci jazyka (viz níže) – u oficiálních
-                        // jazyků ho vypínáme, u našich necháváme zapnutý, aby Diktafon použil DialogInfo.
-
                         // 1. Zjištění z objektu locale
-                        val localeObj = bundle.get("locale")
+                        val localeObj = getBundleAny(bundle, "locale")
                         if (localeObj is Locale) {
                             val tag = localeObj.toLanguageTag()
                             if (tag != "und" && tag.isNotBlank()) {
@@ -159,13 +153,17 @@ object IntelliVoiceHook {
                             }
                         }
 
-                        // 3. Kontrola preferredLocale seznamu:
-                        // VoiceNote posílá seznam dostupných jazyků, kde na prvním místě bývá systémový jazyk Samsungu (např. en-US).
-                        // Pokud byl locale prázdný, hledáme v preferredLocale přednostně náš povolený jazyk (např. cs-CZ, sk-SK...).
+                        // 3. Kontrola preferredLocale / alternative_locale seznamu:
+                        // VoiceNote a Samsung Notes posílají seznam dostupných jazyků, kde na prvním místě bývá systémový jazyk Samsungu.
                         if (detectedLocale.isNullOrBlank() || detectedLocale == "und") {
-                            val pref = bundle.get("preferredLocale")
-                            if (pref is List<*>) {
-                                val prefTags = pref.mapNotNull { item ->
+                            for (altKey in listOf("preferredLocale", "alternative_locale", "alternativeLocale")) {
+                                val pref = getBundleAny(bundle, altKey) ?: continue
+                                val rawItems: List<Any?> = when (pref) {
+                                    is List<*> -> pref
+                                    is Array<*> -> pref.toList()
+                                    else -> listOf(pref)
+                                }
+                                val prefTags = rawItems.mapNotNull { item ->
                                     when (item) {
                                         is Locale -> if (item.toLanguageTag() != "und") item.toLanguageTag() else item.toString()
                                         is String -> item
@@ -173,53 +171,25 @@ object IntelliVoiceHook {
                                     }
                                 }.filter { it.isNotBlank() && it != "und" }
 
-                                // Hledáme shodný jazyk s naší konfigurací
-                                val ourMatch = prefTags.find { tag ->
-                                    config.enabledLocales.any { ourLoc ->
-                                        tag.equals(ourLoc, ignoreCase = true) ||
-                                        tag.startsWith(ourLoc.substringBefore("-"), ignoreCase = true) ||
-                                        ourLoc.startsWith(tag.substringBefore("-"), ignoreCase = true)
-                                    }
+                                val ourMatch = prefTags.firstNotNullOfOrNull { tag ->
+                                    ModuleConfig.matchEnabledLocale(tag, config.enabledLocales)
                                 }
 
                                 if (ourMatch != null) {
-                                    detectedLocale = config.enabledLocales.find {
-                                        it.equals(ourMatch, ignoreCase = true) ||
-                                        it.startsWith(ourMatch.substringBefore("-"), ignoreCase = true) ||
-                                        ourMatch.startsWith(it.substringBefore("-"), ignoreCase = true)
-                                    } ?: ourMatch
-                                    Log.i(TAG, "[IntelliVoice] V preferredLocale nalezen náš povolený jazyk: $detectedLocale")
-                                } else {
+                                    detectedLocale = ourMatch
+                                    Log.i(TAG, "[IntelliVoice] V $altKey nalezen náš povolený jazyk: $detectedLocale")
+                                    break
+                                } else if (detectedLocale.isNullOrBlank() || detectedLocale == "und") {
                                     detectedLocale = prefTags.firstOrNull()
                                 }
                             }
                         }
 
-                        // Pokud byl jazyk stále neznámý, prázdný nebo "und", znamená to, že VoiceNote
-                        // vybral náš přidaný jazyk (který Samsung nativně nezná).
-                        // V takovém případě použijeme první povolený jazyk z naší konfigurace (např. cs-CZ)
                         if (detectedLocale.isNullOrBlank() || detectedLocale == "und") {
                             detectedLocale = config.enabledLocales.firstOrNull() ?: "cs-CZ"
                             Log.i(TAG, "[IntelliVoice] Jazyk v bundle byl neznámý/prázdný, přiřazuji aktivní přidaný jazyk: $detectedLocale")
                         } else {
-                            Log.i(TAG, "[IntelliVoice] PipeUserChannel.prepare finálně detekován jazyk: $detectedLocale")
-                        }
-                        // Samsungí diarizér (com.samsung.android.ai.sd.SpeakerDiarization) nemá na tomto
-                        // zařízení nativní knihovnu – při loadu padá na UnsatisfiedLinkError:
-                        //   Failed to load native library / No implementation found for
-                        //   void com.samsung.android.ai.sd.SpeakerDiarization.native_setup(java.lang.Object)
-                        // VoiceNote přitom posílá enable_speaker_diarisation=true, čímž se rozjede
-                        // RushAndCache s SD a úloha se NIKDY nedokončí -> „Přepisování… 0 %“
-                        // (i pro oficiální jazyky Samsungu, které s vypnutým modulem fungují).
-                        //
-                        // Vypínáme ho ale jen u oficiálních jazyků – u našich vlastních potřebuje
-                        // Diktafon příznak ZAPNUTÝ, jinak ignoruje naše DialogInfo a vypíše
-                        // u všech bublin „Mluvčí 0“.
-                        val isOfficialRequest = OFFICIAL_SAMSUNG_LANGS.any {
-                            detectedLocale.startsWith(it, ignoreCase = true)
-                        }
-                        if (isOfficialRequest) {
-                            Log.i(TAG, "[IntelliVoice] PipeUserChannel.prepare: Oficiální jazyk Samsungu ($detectedLocale), ponechávám bundle beze změny.")
+                            Log.i(TAG, "[IntelliVoice] PipeUserChannel.prepare detekován jazyk: $detectedLocale")
                         }
 
                         val activeSession = ModuleConfig.getActiveSession()
@@ -257,27 +227,14 @@ object IntelliVoiceHook {
                             ?: (ModuleConfig.getActiveSession()?.isCall == true)
 
                         val config = ModuleConfig.load()
-                        val req = requestedLocale?.replace("_", "-") ?: ""
-                        val matchedConfigLocale = config.enabledLocales.find {
-                            it.equals(req, ignoreCase = true) ||
-                            it.startsWith(req, ignoreCase = true) ||
-                            (req.isNotEmpty() && req.startsWith(it.substringBefore("-"), ignoreCase = true))
-                        }
-                        val isOurLanguage = matchedConfigLocale != null
-
-                        // Pokud uživatel vybral jazyk přímo v UI (např. cs-CZ, en-US, sk-SK...),
-                        // obsloužíme jej naším Whisper modelem. Nativní engine Samsungu na tomto
-                        // zařízení přepis nedokončí ani pro angličtinu a zůstává viset na 0%.
-                        val systemLocale = ModuleConfig.systemLocaleTag()
-                        val targetLocale = matchedConfigLocale
-                            ?: (if (req.isNotBlank() && req != "und") req else null)
-                            ?: config.fallbackLocale?.takeIf { it.isNotBlank() }
-                                ?.let { raw -> ModuleConfig.normalizeLocaleTag(raw) }
-                            ?: config.enabledLocales.find {
-                                it.equals(systemLocale, ignoreCase = true) ||
-                                it.substringBefore("-").equals(systemLocale.substringBefore("-"), ignoreCase = true)
-                            }
-                            ?: config.enabledLocales.firstOrNull() ?: "cs-CZ"
+                        // Nativní engine Samsungu bez stažených jazykových sad zůstává viset na 0 %,
+                        // proto všechny požadované jazyky obsluhujeme lokálním Whisper / CzechSpeech enginem.
+                        val targetLocale = ModuleConfig.resolveTargetLocale(
+                            requestedLocale = requestedLocale,
+                            enabledLocales = config.enabledLocales,
+                            fallbackLocale = config.fallbackLocale,
+                            systemLocale = ModuleConfig.systemLocaleTag()
+                        )
                         Log.i(TAG, "[IntelliVoice] PipeUserChannel.write ZACHYCENO! Cílový jazyk: $targetLocale (req: '$requestedLocale', isVoicemail=$isVoicemail, isCall=$isCall)")
                         Log.i(TAG, "[IntelliVoice] Přesměrovávám PCM stream do lokálního Whisper enginu...")
 
@@ -322,22 +279,21 @@ object IntelliVoiceHook {
             return
         }
 
-        // Uložení nahrávky pro diagnostiku výhradně do uživatelského úložiště.
-        // Proces :asr nemá MANAGE_EXTERNAL_STORAGE, takže /storage/emulated/0/GalaxyAI
-        // končí na EPERM – zkusíme i media složku a privátní cache.
-        try {
-            val candidates = listOf(
-                File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/GalaxyAI"),
-                File("/storage/emulated/0/GalaxyAI"),
-                File("/data/local/tmp/GalaxyAI")
-            )
-            for (dir in candidates) {
-                try {
-                    dir.mkdirs()
-                    if (writeWavFile(File(dir, "last_recording.wav"), pcmBytes, 16000, 1)) break
-                } catch (_: Throwable) {}
-            }
-        } catch (_: Throwable) {}
+        val debugLogging = ModuleConfig.load().debugLogging
+        if (debugLogging) {
+            try {
+                val candidates = listOf(
+                    File("/storage/emulated/0/Android/media/com.samsung.android.intellivoiceservice/GalaxyAI"),
+                    File("/storage/emulated/0/GalaxyAI")
+                )
+                for (dir in candidates) {
+                    try {
+                        dir.mkdirs()
+                        if (writeWavFile(File(dir, "last_recording.wav"), pcmBytes, 16000, 1)) break
+                    } catch (_: Throwable) {}
+                }
+            } catch (_: Throwable) {}
+        }
 
         // Přepis s lokálním Whisper enginem (s podporou hlasové schránky a optimalizovaným slučováním oken)
         val sttResult = SttEngineManager.transcribe(
@@ -348,7 +304,11 @@ object IntelliVoiceHook {
             isCall = isCall
         )
 
-        Log.i(TAG, "[IntelliVoice] Přepis [$localeTag] dokončen: \"${sttResult.text}\" (${sttResult.words.size} slov v ${sttResult.sentences.size} segmentech, mluvčí: ${sttResult.segments.map { it.speakerId }.distinct()})")
+        if (debugLogging) {
+            Log.i(TAG, "[IntelliVoice] Přepis [$localeTag] dokončen: \"${sttResult.text}\" (${sttResult.words.size} slov v ${sttResult.sentences.size} segmentech, mluvčí: ${sttResult.segments.map { it.speakerId }.distinct()})")
+        } else {
+            Log.i(TAG, "[IntelliVoice] Přepis [$localeTag] dokončen (${sttResult.words.size} slov v ${sttResult.sentences.size} segmentech, mluvčí: ${sttResult.segments.map { it.speakerId }.distinct()})")
+        }
 
         // 3. Vytvoření DialogInfo s opraveným pořadím parametrů: SpeechInfo(speakerId, startMs, endMs)
         val dialogInfo = serviceClassLoader?.let { createDialogInfo(it, sttResult.segments) }
@@ -417,10 +377,15 @@ object IntelliVoiceHook {
         val out = java.io.ByteArrayOutputStream(1 shl 20)
         val buffer = ByteArray(64 * 1024)
         try {
-            while (true) {
+            while (out.size() < MAX_PCM_BYTES) {
                 val read = inputStream.read(buffer)
                 if (read <= 0) break
-                out.write(buffer, 0, read)
+                val allowed = Math.min(read, MAX_PCM_BYTES - out.size())
+                out.write(buffer, 0, allowed)
+                if (allowed < read) {
+                    Log.w(TAG, "[IntelliVoice] Překročen bezpečnostní limit audio proudu ($MAX_PCM_BYTES B), zbytek zahozen.")
+                    break
+                }
             }
         } catch (e: Throwable) {
             Log.w(TAG, "[IntelliVoice] Čtení audio proudu ukončeno: ${e.javaClass.simpleName}: ${e.message} (načteno ${out.size()} bytů)")
