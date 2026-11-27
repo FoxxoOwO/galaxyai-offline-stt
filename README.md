@@ -1,6 +1,6 @@
 # Galaxy AI Offline Speech-to-Text & Diarization Module
 
-Also check out [S23 Ultra Enhancements](https://github.com/FoxxoOwO/s23-ultimate)
+Also check out [S23 Enhancer](https://github.com/FoxxoOwO/s23-ultimate)
 
 [English](#english) | [Čeština](#čeština)
 
